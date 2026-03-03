@@ -1074,6 +1074,26 @@
             return Number(v || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
         }
 
+        function formatPaperReason(reason) {
+            const key = String(reason || '');
+            const reasonMap = {
+                t_buy: '做T买入',
+                t_sell: '做T卖出',
+                t_buy_costline: '做T买入(成本线偏离)',
+                t_sell_costline: '做T卖出(成本线偏离)',
+                t_buy_replenish: '补底仓买入',
+                t_buy_replenish_costline: '补底仓买入(成本线偏离)',
+                t_daily_budget_exceeded: '超出今日T额度',
+                t_daily_order_limit_reached: '达到今日T单数上限',
+                insufficient_cash_or_position_limit: '现金不足或仓位上限',
+                no_available_qty: '可卖数量不足',
+                available_qty_too_small: '最小交易单位不足',
+                paper_disabled: '模拟交易未开启',
+                base_seed: '底仓初始化'
+            };
+            return reasonMap[key] || key || '--';
+        }
+
         function renderBaseConfigEditor(baseConfigs, activeStocks, currentState) {
             const box = document.getElementById('paper-base-configs');
             if (!box) return;
@@ -1094,20 +1114,46 @@
                 const name = (activeStocks && activeStocks[code]) || cfg.name || code;
                 const amount = Number(cfg.base_amount || 0);
                 const cost = Number(cfg.base_cost_line || Number(((currentState || {})[code] || {}).price || 0));
+                const orderAmt = Number(cfg.t_order_amount || 0);
+                const dayBudget = Number(cfg.t_daily_budget || (amount > 0 ? amount : 0));
+                const strength = Number(cfg.t_costline_strength || 1.0);
                 const enabled = (cfg.enabled === undefined) ? true : !!cfg.enabled;
+                const usedAmt = Number(cfg.t_used_amount || 0);
+                const remainAmt = Number(cfg.t_remaining_amount || Math.max(0, dayBudget - usedAmt));
+                const usedCount = Number(cfg.t_used_count || 0);
+                const maxOrders = Number(cfg.t_max_orders || 0);
+                const remainOrders = Number(cfg.t_remaining_orders || 0);
                 return `
-                    <div class="grid grid-cols-[1.2fr_1fr_1fr_0.7fr] gap-2 items-center bg-slate-900/60 border border-slate-700/50 rounded px-2 py-1.5">
-                        <div class="text-slate-200">${escapeHtml(name)} <span class="text-[10px] text-slate-500">${escapeHtml(code)}</span></div>
+                    <div class="bg-slate-900/60 border border-slate-700/50 rounded px-2 py-1.5">
+                        <div class="flex items-center justify-between mb-1">
+                            <div class="text-slate-200">${escapeHtml(name)} <span class="text-[10px] text-slate-500">${escapeHtml(code)}</span></div>
+                            <div class="text-[10px] text-slate-500">
+                                今日已用 ¥${moneyFmt(usedAmt)} / 剩余 ¥${moneyFmt(remainAmt)}
+                                · 单数 ${maxOrders > 0 ? `${usedCount}/${maxOrders}` : `${usedCount}/不限`}
+                                · 剩余 ${maxOrders > 0 ? `${remainOrders}单` : '不限'}
+                            </div>
+                        </div>
+                        <div class="grid grid-cols-[1fr_1fr_1fr_1fr_0.9fr_0.7fr] gap-2 items-center">
                         <input id="base-amount-${code}" type="number" min="0" step="1000" value="${amount.toFixed(0)}"
                             oninput="baseConfigDirty=true"
                             class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-slate-200 text-[11px]" placeholder="底仓金额">
                         <input id="base-cost-${code}" type="number" min="0" step="0.01" value="${cost > 0 ? cost.toFixed(2) : ''}"
                             oninput="baseConfigDirty=true"
                             class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-slate-200 text-[11px]" placeholder="成本线">
+                        <input id="t-order-amount-${code}" type="number" min="0" step="1000" value="${orderAmt.toFixed(0)}"
+                            oninput="baseConfigDirty=true"
+                            class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-slate-200 text-[11px]" placeholder="单笔T金额">
+                        <input id="t-day-budget-${code}" type="number" min="0" step="1000" value="${dayBudget.toFixed(0)}"
+                            oninput="baseConfigDirty=true"
+                            class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-slate-200 text-[11px]" placeholder="每日T额度">
+                        <input id="t-strength-${code}" type="number" min="0.1" step="0.1" value="${strength.toFixed(1)}"
+                            oninput="baseConfigDirty=true"
+                            class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-slate-200 text-[11px]" placeholder="偏离强度">
                         <label class="text-[10px] text-slate-400 flex items-center gap-1">
                             <input id="base-enabled-${code}" type="checkbox" ${enabled ? 'checked' : ''} onchange="baseConfigDirty=true">
                             启用
                         </label>
+                        </div>
                     </div>`;
             }).join('');
         }
@@ -1121,11 +1167,17 @@
                 const code = el.id.replace('base-amount-', '');
                 const amt = Number(document.getElementById(`base-amount-${code}`)?.value || 0);
                 const cost = Number(document.getElementById(`base-cost-${code}`)?.value || 0);
+                const tOrderAmount = Number(document.getElementById(`t-order-amount-${code}`)?.value || 0);
+                const tDayBudget = Number(document.getElementById(`t-day-budget-${code}`)?.value || 0);
+                const tStrength = Number(document.getElementById(`t-strength-${code}`)?.value || 1.0);
                 const enabled = !!document.getElementById(`base-enabled-${code}`)?.checked;
                 items.push({
                     code,
                     base_amount: Math.max(0, amt),
                     base_cost_line: Math.max(0, cost),
+                    t_order_amount: Math.max(0, tOrderAmount),
+                    t_daily_budget: Math.max(0, tDayBudget),
+                    t_costline_strength: Math.max(0.1, tStrength),
                     enabled
                 });
             });
@@ -1239,6 +1291,12 @@
                                 <div class="text-[10px] text-slate-500 mt-0.5">
                                     底仓 ${p.base_target_qty || 0} 股 · 默认成本线 ${Number(p.base_cost_line || 0).toFixed(2)} · 当前摊薄成本线 ${Number(p.effective_cost_line || 0).toFixed(2)}
                                 </div>
+                                <div class="text-[10px] text-slate-500 mt-0.5">
+                                    单笔T ¥${moneyFmt(p.t_order_amount)} · 每日T额度 ¥${moneyFmt(p.t_daily_budget)} · 今日已用 ¥${moneyFmt(p.t_used_amount)} · 剩余 ¥${moneyFmt(p.t_remaining_amount)}
+                                </div>
+                                <div class="text-[10px] text-slate-500 mt-0.5">
+                                    今日T单数 ${Number(p.t_used_count || 0)} / ${Number(p.t_max_orders || 0) > 0 ? Number(p.t_max_orders) : '不限'} · 剩余 ${Number(p.t_max_orders || 0) > 0 ? `${Number(p.t_remaining_orders || 0)}单` : '不限'}
+                                </div>
                             ` : ''}
                         </div>`;
                 }).join('');
@@ -1258,7 +1316,7 @@
                                 <span class="text-[10px] ${ok ? 'text-emerald-300' : 'text-amber-300'}">${escapeHtml(o.status || '')}</span>
                             </div>
                             <div class="text-[10px] text-slate-400 mt-0.5">
-                                价 ${Number(o.price || 0).toFixed(2)} · 额 ¥${moneyFmt(o.amount)} · 费 ¥${moneyFmt(o.fee)} ${o.reason ? ('· ' + escapeHtml(o.reason)) : ''}
+                                价 ${Number(o.price || 0).toFixed(2)} · 额 ¥${moneyFmt(o.amount)} · 费 ¥${moneyFmt(o.fee)} ${o.reason ? ('· ' + escapeHtml(formatPaperReason(o.reason))) : ''}
                             </div>
                         </div>`;
                 }).join('');

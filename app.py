@@ -407,10 +407,23 @@ def init_db():
             name TEXT DEFAULT '',
             base_amount REAL NOT NULL DEFAULT 0.0,
             base_cost_line REAL NOT NULL DEFAULT 0.0,
+            t_order_amount REAL NOT NULL DEFAULT 0.0,
+            t_daily_budget REAL NOT NULL DEFAULT 0.0,
+            t_costline_strength REAL NOT NULL DEFAULT 1.0,
             enabled INTEGER NOT NULL DEFAULT 1,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    base_alter_sqls = [
+        'ALTER TABLE paper_base_config ADD COLUMN t_order_amount REAL NOT NULL DEFAULT 0.0',
+        'ALTER TABLE paper_base_config ADD COLUMN t_daily_budget REAL NOT NULL DEFAULT 0.0',
+        'ALTER TABLE paper_base_config ADD COLUMN t_costline_strength REAL NOT NULL DEFAULT 1.0'
+    ]
+    for sql in base_alter_sqls:
+        try:
+            conn.execute(sql)
+        except Exception:
+            pass
     conn.execute(
         'INSERT OR IGNORE INTO paper_account (id, starting_cash, cash, realized_pnl) VALUES (1, ?, ?, 0.0)',
         (PAPER_START_CASH, PAPER_START_CASH)
@@ -794,6 +807,70 @@ def calc_base_target_qty(base_amount, base_cost_line, lot_size):
         return 0
     return round_lot_qty(amount / cost_line, lot_size)
 
+def resolve_t_daily_budget(base_amount, t_daily_budget, fallback_budget=0.0):
+    """
+    解析单票日内T额度：
+    1) 未配置时默认使用底仓金额；
+    2) 配置值超过底仓时按底仓封顶；
+    3) 无底仓时回退到 fallback_budget（如按账户净值估算）。
+    """
+    base_amt = max(0.0, float(base_amount or 0.0))
+    day_budget = max(0.0, float(t_daily_budget or 0.0))
+
+    if day_budget <= 0 and base_amt > 0:
+        day_budget = base_amt
+    if base_amt > 0 and day_budget > base_amt:
+        day_budget = base_amt
+    if day_budget <= 0:
+        day_budget = max(0.0, float(fallback_budget or 0.0))
+    return day_budget
+
+def calc_t_order_caps(t_daily_budget, t_order_amount, used_count):
+    """
+    根据“单笔T金额 + 每日T额度”推导最大可做T次数。
+    - t_order_amount<=0: 不按次数限制；
+    - 否则 max_orders=floor(daily_budget / order_amount)。
+    """
+    order_amt = max(0.0, float(t_order_amount or 0.0))
+    day_budget = max(0.0, float(t_daily_budget or 0.0))
+    used = max(0, int(used_count or 0))
+    max_orders = int(day_budget // order_amt) if order_amt > 0 else 0
+    remaining_orders = max(0, max_orders - used) if max_orders > 0 else 0
+    return max_orders, remaining_orders
+
+def get_today_t_usage(code, trade_date):
+    conn = get_db()
+    row = conn.execute(
+        '''
+        SELECT
+            COALESCE(SUM(amount), 0.0) AS used_amount,
+            COUNT(*) AS used_count
+        FROM paper_orders
+        WHERE code=?
+          AND date=?
+          AND status='filled'
+          AND reason LIKE 't_%'
+        ''',
+        (str(code), str(trade_date))
+    ).fetchone()
+    conn.close()
+    return float(row['used_amount'] or 0.0), int(row['used_count'] or 0)
+
+def calc_effective_cost_line_from_pos(base_cfg, pos_row, lot_size):
+    if not base_cfg:
+        return 0.0
+    if not base_cfg.get('enabled'):
+        return 0.0
+    base_amount = float(base_cfg.get('base_amount', 0.0))
+    base_cost_line = float(base_cfg.get('base_cost_line', 0.0))
+    if base_amount <= 0 or base_cost_line <= 0:
+        return 0.0
+    base_qty = calc_base_target_qty(base_amount, base_cost_line, lot_size)
+    if base_qty <= 0:
+        return 0.0
+    realized = float((pos_row['realized_pnl'] if pos_row else 0.0) or 0.0)
+    return max(0.0, base_cost_line - realized / base_qty)
+
 def get_base_config_map(conn=None):
     close_conn = False
     if conn is None:
@@ -801,7 +878,7 @@ def get_base_config_map(conn=None):
         close_conn = True
     rows = conn.execute(
         '''
-        SELECT code, name, base_amount, base_cost_line, enabled, updated_at
+        SELECT code, name, base_amount, base_cost_line, t_order_amount, t_daily_budget, t_costline_strength, enabled, updated_at
         FROM paper_base_config
         '''
     ).fetchall()
@@ -814,6 +891,9 @@ def get_base_config_map(conn=None):
             'name': r['name'],
             'base_amount': float(r['base_amount'] or 0.0),
             'base_cost_line': float(r['base_cost_line'] or 0.0),
+            't_order_amount': float(r['t_order_amount'] or 0.0),
+            't_daily_budget': float(r['t_daily_budget'] or 0.0),
+            't_costline_strength': float(r['t_costline_strength'] or 1.0),
             'enabled': bool(int(r['enabled'] or 0)),
             'updated_at': r['updated_at']
         }
@@ -822,17 +902,25 @@ def get_base_config_map(conn=None):
 def list_base_configs():
     return list(get_base_config_map().values())
 
-def upsert_base_config(code, name, base_amount, base_cost_line, enabled=True):
+def upsert_base_config(code, name, base_amount, base_cost_line, enabled=True, t_order_amount=0.0, t_daily_budget=0.0, t_costline_strength=1.0):
     c = str(code or '').strip().lower()
     if not c:
         return False, 'missing code'
     try:
         amt = float(base_amount or 0.0)
         cost = float(base_cost_line or 0.0)
+        ord_amt = float(t_order_amount or 0.0)
+        day_budget = float(t_daily_budget or 0.0)
+        strength = float(t_costline_strength or 1.0)
     except Exception:
-        return False, 'invalid amount or cost'
-    if amt < 0 or cost < 0:
-        return False, 'amount/cost must be >= 0'
+        return False, 'invalid numeric fields'
+    if amt < 0 or cost < 0 or ord_amt < 0 or day_budget < 0:
+        return False, 'amount/cost/budget must be >= 0'
+    if strength <= 0:
+        return False, 't_costline_strength must be > 0'
+    day_budget = resolve_t_daily_budget(amt, day_budget, fallback_budget=0.0)
+    if day_budget > 0 and ord_amt > day_budget:
+        ord_amt = day_budget
     conn = get_db()
     existing = conn.execute('SELECT name FROM paper_base_config WHERE code=?', (c,)).fetchone()
     final_name = str(name or '').strip()
@@ -844,10 +932,10 @@ def upsert_base_config(code, name, base_amount, base_cost_line, enabled=True):
     conn.execute(
         '''
         INSERT OR REPLACE INTO paper_base_config
-        (code, name, base_amount, base_cost_line, enabled, updated_at)
-        VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)
+        (code, name, base_amount, base_cost_line, t_order_amount, t_daily_budget, t_costline_strength, enabled, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
         ''',
-        (c, final_name, amt, cost, 1 if enabled else 0)
+        (c, final_name, amt, cost, ord_amt, day_budget, strength, 1 if enabled else 0)
     )
     conn.commit()
     conn.close()
@@ -972,43 +1060,79 @@ def plan_paper_order(sig, market_price, account_row, pos_row, nav_approx):
     cash = float(account_row['cash'] or 0.0)
     pos_total = int(pos_row['total_qty']) if pos_row else 0
     pos_available = int(pos_row['available_qty']) if pos_row else 0
+    pos_realized = float((pos_row['realized_pnl'] if pos_row else 0.0) or 0.0)
     base_cfg = get_base_config_map().get(code, {})
     base_qty = 0
     if base_cfg and base_cfg.get('enabled'):
         base_qty = calc_base_target_qty(base_cfg.get('base_amount', 0.0), base_cfg.get('base_cost_line', 0.0), min_lot)
+    base_amount = float(base_cfg.get('base_amount', 0.0)) if base_cfg else 0.0
+    t_order_amount = float(base_cfg.get('t_order_amount', 0.0)) if base_cfg else 0.0
+    t_daily_budget = float(base_cfg.get('t_daily_budget', 0.0)) if base_cfg else 0.0
+    t_costline_strength = float(base_cfg.get('t_costline_strength', 1.0)) if base_cfg else 1.0
+    t_costline_strength = max(0.1, t_costline_strength)
+    t_daily_budget = resolve_t_daily_budget(base_amount, t_daily_budget, fallback_budget=nav_approx * max_stock_pct)
+    used_amount, used_count = get_today_t_usage(code, sig_date)
+    remaining_budget = max(0.0, t_daily_budget - used_amount)
+    max_orders, remaining_orders = calc_t_order_caps(t_daily_budget, t_order_amount, used_count)
+    effective_cost_line = calc_effective_cost_line_from_pos(base_cfg, pos_row, min_lot)
+
+    target_budget = t_order_amount if t_order_amount > 0 else max(0.0, nav_approx * base_pct)
+    target_budget *= trend_mul
+    reason = 't_buy' if side == 'BUY' else 't_sell'
+    if side == 'BUY' and pos_total < base_qty:
+        reason = 't_buy_replenish'
+        need_budget = max(0.0, (base_qty - pos_total) * exec_price)
+        if t_order_amount <= 0:
+            target_budget = max(target_budget, min(need_budget, t_daily_budget))
+        else:
+            target_budget = min(max(target_budget, need_budget), max(t_order_amount, need_budget))
+
+    # 围绕成本线做 T：低于成本线偏买，高于成本线偏卖。
+    if effective_cost_line > 0:
+        dev = (effective_cost_line - exec_price) / effective_cost_line
+        cost_mul = 1.0
+        if side == 'BUY':
+            if dev > 0:
+                cost_mul = 1.0 + min(1.5, dev * 6.0 * t_costline_strength)
+            else:
+                cost_mul = max(0.4, 1.0 - min(0.6, abs(dev) * 3.0 * t_costline_strength))
+        else:
+            if dev < 0:
+                cost_mul = 1.0 + min(1.5, abs(dev) * 6.0 * t_costline_strength)
+            else:
+                cost_mul = max(0.4, 1.0 - min(0.6, abs(dev) * 3.0 * t_costline_strength))
+        target_budget *= cost_mul
+        if abs(dev) >= 0.003:
+            reason = reason + '_costline'
 
     qty = 0
-    reason = ''
-    if side == 'BUY':
-        if pos_total < base_qty:
-            # 底仓不足时优先补齐底仓
-            need_qty = base_qty - pos_total
-            budget = min(cash, need_qty * exec_price)
-            qty = round_lot_qty(budget / exec_price, min_lot)
-            if qty > 0:
-                reason = 'base_replenish'
-        if qty <= 0:
-            target_budget = max(0.0, nav_approx * base_pct * trend_mul)
-            cur_exposure = pos_total * exec_price
-            max_stock_budget = max(0.0, nav_approx * max_stock_pct - cur_exposure)
-            budget = min(target_budget, max_stock_budget, cash)
-            qty = round_lot_qty(budget / exec_price, min_lot)
+    reject_reason = ''
+    budget = min(target_budget, remaining_budget)
+    if max_orders > 0 and used_count >= max_orders:
+        reject_reason = 't_daily_order_limit_reached'
+    elif budget < exec_price * min_lot:
+        reject_reason = 't_daily_budget_exceeded'
+    elif side == 'BUY':
+        cur_exposure = pos_total * exec_price
+        max_stock_budget = max(0.0, nav_approx * max_stock_pct - cur_exposure)
+        budget = min(budget, max_stock_budget, cash)
+        qty = round_lot_qty(budget / exec_price, min_lot)
         if qty < min_lot:
-            reason = 'insufficient_cash_or_position_limit'
+            reject_reason = 'insufficient_cash_or_position_limit'
     else:
-        sellable_qty = max(0, pos_available - base_qty)
+        sellable_qty = round_lot_qty(max(0, pos_available), min_lot)
         if sellable_qty < min_lot:
-            reason = 'no_available_qty'
+            reject_reason = 'no_available_qty'
         else:
-            base_sell_frac = 0.35 * trend_mul
-            base_sell_frac = max(0.1, min(base_sell_frac, 1.0))
-            qty = round_lot_qty(pos_total * base_sell_frac, min_lot)
-            qty = min(qty, round_lot_qty(sellable_qty, min_lot))
+            qty = round_lot_qty(budget / exec_price, min_lot)
+            qty = min(qty, sellable_qty)
             if qty < min_lot:
-                reason = 'available_qty_too_small'
+                reject_reason = 'available_qty_too_small' if budget >= exec_price * min_lot else 't_daily_budget_exceeded'
 
     amount = qty * exec_price
     fee = calc_paper_order_fee(side, amount, commission_rate, sell_stamp_tax) if qty > 0 else 0.0
+    status = 'filled' if qty > 0 else 'rejected'
+    final_reason = reason if qty > 0 else reject_reason
     order = {
         'order_id': str(uuid.uuid4()),
         'signal_id': signal_id,
@@ -1021,12 +1145,22 @@ def plan_paper_order(sig, market_price, account_row, pos_row, nav_approx):
         'price': round(exec_price, 4),
         'amount': round(amount, 2),
         'fee': round(fee, 2),
-        'status': 'filled' if qty > 0 else 'rejected',
-        'reason': reason,
+        'status': status,
+        'reason': final_reason,
         'trend': trend_text,
-        'base_qty': int(base_qty)
+        'base_qty': int(base_qty),
+        'base_amount': round(base_amount, 2),
+        'effective_cost_line': round(effective_cost_line, 4),
+        't_order_amount': round(t_order_amount, 2),
+        't_daily_budget': round(t_daily_budget, 2),
+        't_used_amount': round(used_amount, 2),
+        't_max_orders': int(max_orders),
+        't_remaining_orders': int(remaining_orders),
+        't_remaining_before': round(remaining_budget, 2),
+        't_remaining_after': round(max(0.0, remaining_budget - amount), 2),
+        't_used_count': int(used_count)
     }
-    return {'ok': qty > 0, 'reason': reason, 'order': order}
+    return {'ok': qty > 0, 'reason': final_reason, 'order': order}
 
 def execute_paper_order(order):
     conn = get_db()
@@ -1189,6 +1323,7 @@ def maybe_execute_paper_trade(sig, market_price):
 def get_paper_snapshot(current_state=None, recent_limit=30):
     current_state = current_state or {}
     paper_rollover_if_new_day()
+    trade_date = datetime.datetime.now().strftime('%Y-%m-%d')
     conn = get_db()
     account = conn.execute('SELECT * FROM paper_account WHERE id=1').fetchone()
     if not account:
@@ -1215,8 +1350,18 @@ def get_paper_snapshot(current_state=None, recent_limit=30):
         ''',
         (max(1, min(int(recent_limit), 200)),)
     ).fetchall()
+    usage_rows = conn.execute(
+        '''
+        SELECT code, COALESCE(SUM(amount), 0.0) AS used_amount, COUNT(*) AS used_count
+        FROM paper_orders
+        WHERE date=? AND status='filled' AND reason LIKE 't_%'
+        GROUP BY code
+        ''',
+        (trade_date,)
+    ).fetchall()
     base_cfg_map = get_base_config_map(conn)
     conn.close()
+    usage_map = {str(r['code']): {'used_amount': float(r['used_amount'] or 0.0), 'used_count': int(r['used_count'] or 0)} for r in usage_rows}
 
     cash = float(account['cash'] or 0.0)
     starting_cash = float(account['starting_cash'] or PAPER_START_CASH)
@@ -1233,6 +1378,10 @@ def get_paper_snapshot(current_state=None, recent_limit=30):
         base_enabled = bool(base_cfg.get('enabled')) if base_cfg else False
         base_amount = float(base_cfg.get('base_amount', 0.0)) if base_cfg else 0.0
         base_cost_line = float(base_cfg.get('base_cost_line', 0.0)) if base_cfg else 0.0
+        t_order_amount = float(base_cfg.get('t_order_amount', 0.0)) if base_cfg else 0.0
+        t_daily_budget = resolve_t_daily_budget(base_amount, float(base_cfg.get('t_daily_budget', 0.0)) if base_cfg else 0.0)
+        t_usage = usage_map.get(code, {'used_amount': 0.0, 'used_count': 0})
+        t_max_orders, t_remaining_orders = calc_t_order_caps(t_daily_budget, t_order_amount, t_usage.get('used_count', 0))
         base_target_qty = calc_base_target_qty(base_amount, base_cost_line, lot_size)
         cur_price = float(current_state.get(code, {}).get('price', r['avg_cost']) or r['avg_cost'] or 0.0)
         total_qty = int(r['total_qty'] or 0)
@@ -1261,8 +1410,28 @@ def get_paper_snapshot(current_state=None, recent_limit=30):
             'base_cost_line': round(base_cost_line, 4),
             'base_target_qty': int(base_target_qty),
             'effective_cost_line': round(effective_cost_line, 4) if effective_cost_line > 0 else 0.0,
+            't_order_amount': round(t_order_amount, 2),
+            't_daily_budget': round(t_daily_budget, 2),
+            't_used_amount': round(float(t_usage.get('used_amount', 0.0)), 2),
+            't_used_count': int(t_usage.get('used_count', 0)),
+            't_max_orders': int(t_max_orders),
+            't_remaining_orders': int(t_remaining_orders),
+            't_remaining_amount': round(max(0.0, t_daily_budget - float(t_usage.get('used_amount', 0.0))), 2),
             'updated_at': r['updated_at']
         })
+
+    base_items = []
+    for code, cfg in base_cfg_map.items():
+        u = usage_map.get(code, {'used_amount': 0.0, 'used_count': 0})
+        day_budget = resolve_t_daily_budget(cfg.get('base_amount', 0.0), cfg.get('t_daily_budget', 0.0))
+        t_max_orders, t_remaining_orders = calc_t_order_caps(day_budget, cfg.get('t_order_amount', 0.0), u.get('used_count', 0))
+        item = dict(cfg)
+        item['t_used_amount'] = round(float(u.get('used_amount', 0.0)), 2)
+        item['t_used_count'] = int(u.get('used_count', 0))
+        item['t_max_orders'] = int(t_max_orders)
+        item['t_remaining_orders'] = int(t_remaining_orders)
+        item['t_remaining_amount'] = round(max(0.0, day_budget - float(u.get('used_amount', 0.0))), 2)
+        base_items.append(item)
 
     nav = cash + market_value
     return {
@@ -1277,7 +1446,7 @@ def get_paper_snapshot(current_state=None, recent_limit=30):
         'return_pct': round(((nav - starting_cash) / starting_cash * 100.0) if starting_cash > 0 else 0.0, 4),
         'positions': positions,
         'recent_orders': [dict(r) for r in order_rows],
-        'base_configs': list(base_cfg_map.values())
+        'base_configs': base_items
     }
 
 def reset_paper_account(starting_cash=None):
@@ -3010,7 +3179,10 @@ def api_paper_base_config_upsert():
             item.get('name', ''),
             item.get('base_amount', 0.0),
             item.get('base_cost_line', 0.0),
-            enabled=to_bool(item.get('enabled', True))
+            enabled=to_bool(item.get('enabled', True)),
+            t_order_amount=item.get('t_order_amount', 0.0),
+            t_daily_budget=item.get('t_daily_budget', 0.0),
+            t_costline_strength=item.get('t_costline_strength', 1.0)
         )
         results.append({
             'code': (item.get('code') or '').lower(),

@@ -133,6 +133,13 @@ def register_management_routes(
             log_debug_event('config_update_failed', {'changes': data, 'error': str(e)})
             return jsonify({'success': False, 'msg': str(e)})
 
+    @bp.route('/api/config', methods=['GET'])
+    def api_get_config_route():
+        return jsonify({
+            'success': True,
+            'strategy': get_strategy_snapshot()
+        })
+
     @bp.route('/api/config/snapshots', methods=['GET'])
     def api_list_config_snapshots_route():
         try:
@@ -199,10 +206,15 @@ def register_management_routes(
 
     @bp.route('/api/history')
     def api_history_route():
+        conn = None
         try:
             conn = get_db()
             date_q = request.args.get('date')
-            days_q = int(request.args.get('days', 7))
+            try:
+                days_q = int(request.args.get('days', 7))
+            except Exception:
+                days_q = 7
+            days_q = max(1, min(days_q, 365))
 
             if date_q:
                 signals = conn.execute('SELECT * FROM signals WHERE date=? ORDER BY created_at DESC', (date_q,)).fetchall()
@@ -213,8 +225,6 @@ def register_management_routes(
                 stats = None
 
             daily = conn.execute('SELECT * FROM daily_stats ORDER BY date DESC LIMIT ?', (days_q,)).fetchall()
-            conn.close()
-
             return jsonify({
                 'signals': [dict(r) for r in signals],
                 'daily_stats': [dict(r) for r in daily],
@@ -222,5 +232,8 @@ def register_management_routes(
             })
         except Exception as e:
             return jsonify({'error': str(e)})
+        finally:
+            if conn is not None:
+                conn.close()
 
     app.register_blueprint(bp)

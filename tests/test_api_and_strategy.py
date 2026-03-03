@@ -159,6 +159,12 @@ def test_management_route_group_still_serves_core_endpoints(load_app):
     app_module = load_app()
     client = app_module.app.test_client()
 
+    config_get_resp = client.get('/api/config')
+    assert config_get_resp.status_code == 200
+    config_get_payload = config_get_resp.get_json()
+    assert config_get_payload.get('success') is True
+    assert isinstance(config_get_payload.get('strategy'), dict)
+
     paper_resp = client.get('/api/paper/account')
     assert paper_resp.status_code == 200
     assert paper_resp.get_json().get('success') is True
@@ -174,6 +180,11 @@ def test_management_route_group_still_serves_core_endpoints(load_app):
     history_payload = history_resp.get_json()
     assert 'signals' in history_payload
     assert 'daily_stats' in history_payload
+
+    history_bad_days_resp = client.get('/api/history?days=not-a-number')
+    assert history_bad_days_resp.status_code == 200
+    history_bad_days_payload = history_bad_days_resp.get_json()
+    assert 'signals' in history_bad_days_payload
 
 
 def test_report_route_group_still_serves_debug_and_daily_endpoints(load_app):

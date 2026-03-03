@@ -201,3 +201,34 @@ def test_report_route_group_still_serves_debug_and_daily_endpoints(load_app):
     daily_payload = daily_resp.get_json()
     assert 'report' in daily_payload
     assert 'json_path' in daily_payload
+
+
+def test_history_endpoint_supports_code_and_status_filters(load_app):
+    app_module = load_app()
+    conn = app_module.get_db()
+    conn.execute(
+        '''
+        INSERT INTO signals (id, date, time, seq_no, code, name, type, level, price, desc, status, profit_pct, gross_profit_pct)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+        (
+            'sig_filter_demo', '2026-03-03', '10:05:00', 1, 'sh600079', '测试股票',
+            'BUY', 1, 10.0, 'filter-demo', 'success', 0.8, 0.9
+        )
+    )
+    conn.commit()
+    conn.close()
+
+    client = app_module.app.test_client()
+
+    filtered_resp = client.get('/api/history?days=7&code=sh600079&status=success')
+    assert filtered_resp.status_code == 200
+    filtered_payload = filtered_resp.get_json()
+    assert len(filtered_payload.get('signals') or []) >= 1
+    assert all((item.get('code') or '').lower() == 'sh600079' for item in filtered_payload.get('signals') or [])
+    assert all((item.get('status') or '').lower() == 'success' for item in filtered_payload.get('signals') or [])
+
+    invalid_status_resp = client.get('/api/history?days=7&status=weird')
+    assert invalid_status_resp.status_code == 200
+    invalid_status_payload = invalid_status_resp.get_json()
+    assert 'invalid status' in (invalid_status_payload.get('error') or '')

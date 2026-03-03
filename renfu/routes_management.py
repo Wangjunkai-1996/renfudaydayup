@@ -210,20 +210,40 @@ def register_management_routes(
         try:
             conn = get_db()
             date_q = request.args.get('date')
+            code_q = (request.args.get('code') or '').strip().lower()
+            status_q = (request.args.get('status') or '').strip().lower()
+            if status_q and status_q not in {'pending', 'success', 'fail'}:
+                return jsonify({'error': f'invalid status: {status_q}'})
             try:
                 days_q = int(request.args.get('days', 7))
             except Exception:
                 days_q = 7
             days_q = max(1, min(days_q, 365))
 
+            signal_params = []
             if date_q:
-                signals = conn.execute('SELECT * FROM signals WHERE date=? ORDER BY created_at DESC', (date_q,)).fetchall()
+                signal_sql = 'SELECT * FROM signals WHERE date=?'
+                signal_params.append(date_q)
                 stats = conn.execute('SELECT * FROM daily_stats WHERE date=?', (date_q,)).fetchone()
             else:
                 since = (datetime.datetime.now() - datetime.timedelta(days=days_q)).strftime('%Y-%m-%d')
-                signals = conn.execute('SELECT * FROM signals WHERE date>=? ORDER BY date DESC, created_at DESC', (since,)).fetchall()
+                signal_sql = 'SELECT * FROM signals WHERE date>=?'
+                signal_params.append(since)
                 stats = None
 
+            if code_q:
+                signal_sql += ' AND LOWER(code)=?'
+                signal_params.append(code_q)
+            if status_q:
+                signal_sql += ' AND status=?'
+                signal_params.append(status_q)
+
+            if date_q:
+                signal_sql += ' ORDER BY created_at DESC'
+            else:
+                signal_sql += ' ORDER BY date DESC, created_at DESC'
+
+            signals = conn.execute(signal_sql, tuple(signal_params)).fetchall()
             daily = conn.execute('SELECT * FROM daily_stats ORDER BY date DESC LIMIT ?', (days_q,)).fetchall()
             return jsonify({
                 'signals': [dict(r) for r in signals],

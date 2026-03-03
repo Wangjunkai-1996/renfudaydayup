@@ -191,6 +191,15 @@
                         <span id="paper-return-badge"
                             class="text-[10px] px-2 py-0.5 rounded border border-slate-600 text-slate-300 bg-slate-700/40">--</span>
                     </div>
+                    <div class="mb-3 flex items-center gap-2 text-[11px]">
+                        <span class="text-slate-400">模拟总资金</span>
+                        <input id="paper-starting-cash" type="number" min="10000" step="10000" value="800000"
+                            oninput="paperCapitalDirty=true"
+                            class="w-36 bg-slate-800 border border-slate-600 rounded px-2 py-1 text-slate-200">
+                        <button onclick="applyPaperCapitalReset()"
+                            class="px-2 py-1 rounded bg-rose-600 hover:bg-rose-500 text-white border border-rose-500/50">应用并重置</button>
+                        <span class="text-slate-500">会清空当前模拟订单和持仓</span>
+                    </div>
                     <div class="grid grid-cols-2 lg:grid-cols-5 gap-2 text-[11px] mb-3">
                         <div class="bg-slate-900/70 rounded p-2 border border-slate-700/50">
                             <div class="text-slate-500">净值</div>
@@ -303,6 +312,7 @@
         let preCloseNotifiedSignals = new Set();
         let lastPreCloseStage = '';
         let baseConfigDirty = false;
+        let paperCapitalDirty = false;
 
         // === 信号音效系统 (Web Audio API) ===
         function playSignalSound(type) {
@@ -1139,6 +1149,37 @@
             }
         }
 
+        async function applyPaperCapitalReset() {
+            const input = document.getElementById('paper-starting-cash');
+            if (!input) return;
+            const val = Number(input.value || 0);
+            if (!Number.isFinite(val) || val < 10000) {
+                alert('请输入不小于 10000 的模拟资金');
+                return;
+            }
+            if (!confirm(`确认将模拟资金重置为 ¥${moneyFmt(val)} 吗？这会清空当前模拟订单与持仓。`)) {
+                return;
+            }
+            try {
+                const res = await fetch('/api/paper/reset', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ confirm: true, starting_cash: val })
+                });
+                const data = await res.json();
+                if (!data.success) {
+                    alert(data.msg || '重置模拟资金失败');
+                    return;
+                }
+                paperCapitalDirty = false;
+                alert('模拟资金已重置');
+                fetchData();
+            } catch (e) {
+                console.error('reset paper capital error:', e);
+                alert('重置模拟资金失败');
+            }
+        }
+
         function renderPaperPanel(paper, activeStocks, currentState) {
             const navEl = document.getElementById('paper-nav');
             const cashEl = document.getElementById('paper-cash');
@@ -1148,7 +1189,8 @@
             const retBadgeEl = document.getElementById('paper-return-badge');
             const posEl = document.getElementById('paper-positions');
             const orderEl = document.getElementById('paper-orders');
-            if (!navEl || !cashEl || !mvEl || !realizedEl || !unrealizedEl || !retBadgeEl || !posEl || !orderEl) return;
+            const capitalInput = document.getElementById('paper-starting-cash');
+            if (!navEl || !cashEl || !mvEl || !realizedEl || !unrealizedEl || !retBadgeEl || !posEl || !orderEl || !capitalInput) return;
 
             if (!paper) {
                 navEl.innerText = '--';
@@ -1161,6 +1203,10 @@
                 orderEl.innerHTML = '<div class="text-slate-500">暂无订单</div>';
                 renderBaseConfigEditor([], activeStocks || {}, currentState || {});
                 return;
+            }
+
+            if (!paperCapitalDirty) {
+                capitalInput.value = String(Math.round(Number(paper.starting_cash || 0)));
             }
 
             navEl.innerText = `¥${moneyFmt(paper.nav)}`;

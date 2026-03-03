@@ -12,6 +12,8 @@ __pycache__/
 data/signals.db
 data/debug_logs/
 data/reports/
+data/server.log
+data/server.pid
 
 # Local virtual env
 .venv/

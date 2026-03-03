@@ -153,3 +153,40 @@ def test_periodic_report_endpoint(load_app):
     report = payload.get('report') or {}
     assert len(report.get('weekly_items') or []) == 2
     assert len(report.get('monthly_items') or []) == 2
+
+
+def test_management_route_group_still_serves_core_endpoints(load_app):
+    app_module = load_app()
+    client = app_module.app.test_client()
+
+    paper_resp = client.get('/api/paper/account')
+    assert paper_resp.status_code == 200
+    assert paper_resp.get_json().get('success') is True
+
+    snapshots_resp = client.get('/api/config/snapshots?limit=5')
+    assert snapshots_resp.status_code == 200
+    snapshots_payload = snapshots_resp.get_json()
+    assert snapshots_payload.get('success') is True
+    assert isinstance(snapshots_payload.get('items'), list)
+
+    history_resp = client.get('/api/history?days=1')
+    assert history_resp.status_code == 200
+    history_payload = history_resp.get_json()
+    assert 'signals' in history_payload
+    assert 'daily_stats' in history_payload
+
+
+def test_report_route_group_still_serves_debug_and_daily_endpoints(load_app):
+    app_module = load_app()
+    client = app_module.app.test_client()
+
+    debug_resp = client.get('/api/debug/logs?limit=20')
+    assert debug_resp.status_code == 200
+    debug_payload = debug_resp.get_json()
+    assert isinstance(debug_payload.get('entries'), list)
+
+    daily_resp = client.get('/api/reports/daily?generate=0')
+    assert daily_resp.status_code == 200
+    daily_payload = daily_resp.get_json()
+    assert 'report' in daily_payload
+    assert 'json_path' in daily_payload

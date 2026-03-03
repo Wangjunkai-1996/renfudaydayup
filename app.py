@@ -30,6 +30,7 @@ HEADERS = {'Referer': 'http://finance.sina.com.cn'}
 MAX_STOCKS = 3
 MARKET_CLOSE_MINUTE = 15 * 60
 PRE_CLOSE_FLATTEN_MINUTE = 14 * 60 + 57
+PRE_CLOSE_WARN_MINUTE = 14 * 60 + 50
 
 # === SQLite 持久化 ===
 DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
@@ -547,6 +548,112 @@ def is_pre_close_window(now=None):
         return False
     m = dt.hour * 60 + dt.minute
     return PRE_CLOSE_FLATTEN_MINUTE <= m <= MARKET_CLOSE_MINUTE
+
+def build_pre_close_alert_snapshot(pending_list, current_state, now=None):
+    """
+    构建尾盘提醒：
+    - 14:50-14:56：提醒手动关注待平仓单
+    - 14:57-15:00：进入系统强平窗口
+    """
+    dt = now or datetime.datetime.now()
+    today = dt.strftime('%Y-%m-%d')
+    if dt.weekday() >= 5:
+        return {
+            'enabled': False,
+            'stage': 'off',
+            'msg': '非交易日',
+            'minutes_to_close': None,
+            'alert_items': []
+        }
+
+    minute = dt.hour * 60 + dt.minute
+    minutes_to_close = MARKET_CLOSE_MINUTE - minute
+    if minute < PRE_CLOSE_WARN_MINUTE:
+        stage = 'normal'
+    elif minute < PRE_CLOSE_FLATTEN_MINUTE:
+        stage = 'warn'
+    elif minute <= MARKET_CLOSE_MINUTE:
+        stage = 'force'
+    else:
+        stage = 'closed'
+
+    alert_items = []
+    for sig in pending_list:
+        if str(sig.get('date', '')) != today:
+            continue
+        code = str(sig.get('code', ''))
+        current_price = float(current_state.get(code, {}).get('price', sig.get('price', 0.0)) or 0.0)
+        entry_price = float(sig.get('price', 0.0) or 0.0)
+        sig_type = str(sig.get('type', ''))
+        win_price = float(sig.get('win_price', 0.0) or 0.0)
+        stop_price = float(sig.get('stop_price', 0.0) or 0.0)
+
+        # 若动态止盈止损尚未初始化，则用策略默认阈值兜底。
+        if entry_price > 0 and (win_price <= 0 or stop_price <= 0):
+            with state_lock:
+                win_threshold = float(success_rates.get('win_threshold', 0.010))
+                loss_threshold = float(success_rates.get('loss_threshold', 0.008))
+            if sig_type == 'BUY':
+                win_price = entry_price * (1 + win_threshold)
+                stop_price = entry_price * (1 - loss_threshold)
+            else:
+                win_price = entry_price * (1 - win_threshold)
+                stop_price = entry_price * (1 + loss_threshold)
+
+        if sig_type == 'BUY':
+            hit_win = current_price >= win_price if win_price > 0 else False
+            hit_stop = current_price <= stop_price if stop_price > 0 else False
+        else:
+            hit_win = current_price <= win_price if win_price > 0 else False
+            hit_stop = current_price >= stop_price if stop_price > 0 else False
+
+        gross_return, net_return, predicted = classify_trade_result(sig_type, entry_price, current_price)
+        should_flatten = (stage in ('warn', 'force')) and (not hit_win) and (not hit_stop)
+        alert_items.append({
+            'signal_id': sig.get('id'),
+            'seq_no': int(sig.get('seq_no') or 0),
+            'code': code,
+            'name': sig.get('name', ''),
+            'type': sig_type,
+            'time': sig.get('time', ''),
+            'entry_price': entry_price,
+            'current_price': current_price,
+            'win_price': win_price,
+            'stop_price': stop_price,
+            'hit_win': hit_win,
+            'hit_stop': hit_stop,
+            'should_flatten': should_flatten,
+            'gross_profit_pct': round(gross_return * 100, 4),
+            'net_profit_pct': round(net_return * 100, 4),
+            'predicted_result': predicted
+        })
+
+    alert_items.sort(
+        key=lambda x: (
+            0 if x.get('should_flatten') else 1,
+            abs(float(x.get('net_profit_pct', 0.0)))
+        ),
+        reverse=False
+    )
+
+    if stage == 'warn':
+        msg = f'距离收盘约 {max(0, minutes_to_close)} 分钟，优先处理未触发止盈止损的挂单'
+    elif stage == 'force':
+        msg = f'已进入强平窗口（{max(0, minutes_to_close)} 分钟内收盘）'
+    elif stage == 'closed':
+        msg = '已收盘'
+    else:
+        msg = '盘中正常监控'
+
+    return {
+        'enabled': stage in ('warn', 'force'),
+        'stage': stage,
+        'msg': msg,
+        'minutes_to_close': max(0, minutes_to_close) if stage != 'off' else None,
+        'pending_count': len(alert_items),
+        'need_flatten_count': sum(1 for x in alert_items if x.get('should_flatten')),
+        'alert_items': alert_items
+    }
 
 def parse_signal_score(desc):
     m = re.search(r'评分:(\d+)%', desc or '')
@@ -2120,6 +2227,7 @@ def get_data():
         active_stocks_snapshot = dict(active_stocks)
         market_data_snapshot = {code: list(points) for code, points in market_data.items()}
         signals_snapshot = [dict(sig) for sig in signals_history]
+        pending_snapshot = [dict(sig) for sig in pending_signals]
         stats_snapshot = copy.deepcopy(success_rates)
         contexts_snapshot = {
             code: {
@@ -2151,7 +2259,8 @@ def get_data():
                 'yest_close': extras.get('yest_close', 0),
                 'open_price': extras.get('open_price', 0)
             }
-            
+    pre_close_snapshot = build_pre_close_alert_snapshot(pending_snapshot, current_state)
+
     return jsonify({
         'active_stocks': active_stocks_snapshot,
         'market_data': market_data_snapshot,
@@ -2162,6 +2271,7 @@ def get_data():
         'r_breaker': rb_levels,
         'extras': extras_snapshot,
         'global': global_snapshot,
+        'pre_close': pre_close_snapshot,
         'is_trading': is_trading_time()
     })
 

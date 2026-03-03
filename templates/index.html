@@ -89,6 +89,20 @@
             </div>
         </header>
 
+        <div id="preclose-alert-panel"
+            class="hidden mb-4 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 shadow-lg">
+            <div class="flex items-center justify-between gap-3">
+                <div class="flex items-center gap-2">
+                    <span id="preclose-stage-badge"
+                        class="text-[10px] px-2 py-0.5 rounded border border-amber-400/30 text-amber-200 bg-amber-500/20">尾盘提醒</span>
+                    <span id="preclose-alert-title" class="text-sm text-amber-100 font-medium">--</span>
+                </div>
+                <span id="preclose-alert-count"
+                    class="text-[11px] text-amber-200 border border-amber-400/20 rounded px-2 py-0.5">--</span>
+            </div>
+            <div id="preclose-alert-list" class="mt-2 grid grid-cols-1 xl:grid-cols-2 gap-2 text-[11px]"></div>
+        </div>
+
         <div class="grid grid-cols-1 xl:grid-cols-4 gap-6">
             <!-- Left Region -->
             <div class="xl:col-span-3 space-y-6 flex flex-col">
@@ -232,6 +246,8 @@
         let targetLoss = 0.008;
         let strategyPanelLastFetchTs = 0;
         let strategyPanelLoading = false;
+        let preCloseNotifiedSignals = new Set();
+        let lastPreCloseStage = '';
 
         // === 信号音效系统 (Web Audio API) ===
         function playSignalSound(type) {
@@ -912,6 +928,83 @@
             }
         }
 
+        function renderPreCloseAlerts(preClose) {
+            const panel = document.getElementById('preclose-alert-panel');
+            const badge = document.getElementById('preclose-stage-badge');
+            const title = document.getElementById('preclose-alert-title');
+            const count = document.getElementById('preclose-alert-count');
+            const list = document.getElementById('preclose-alert-list');
+            if (!panel || !badge || !title || !count || !list) return;
+
+            if (!preClose || !preClose.enabled) {
+                panel.classList.add('hidden');
+                if (preClose && preClose.stage !== lastPreCloseStage) {
+                    preCloseNotifiedSignals.clear();
+                    lastPreCloseStage = preClose.stage || '';
+                }
+                return;
+            }
+
+            panel.classList.remove('hidden');
+            const stage = preClose.stage || 'warn';
+            lastPreCloseStage = stage;
+
+            if (stage === 'force') {
+                badge.className = 'text-[10px] px-2 py-0.5 rounded border border-rose-400/40 text-rose-200 bg-rose-500/25';
+                badge.innerText = '强平窗口';
+            } else {
+                badge.className = 'text-[10px] px-2 py-0.5 rounded border border-amber-400/30 text-amber-200 bg-amber-500/20';
+                badge.innerText = '尾盘提醒';
+            }
+
+            title.innerText = preClose.msg || '临近收盘，请检查挂单';
+            count.innerText = `待平: ${preClose.need_flatten_count || 0} / 挂单: ${preClose.pending_count || 0}`;
+
+            const items = preClose.alert_items || [];
+            if (!items.length) {
+                list.innerHTML = '<div class="text-slate-300">当前没有待平挂单</div>';
+                return;
+            }
+
+            list.innerHTML = items.slice(0, 8).map(item => {
+                const should = !!item.should_flatten;
+                const cardCls = should
+                    ? 'border-amber-500/40 bg-amber-500/10 text-amber-100'
+                    : 'border-slate-600/60 bg-slate-800/60 text-slate-300';
+                const pnl = Number(item.net_profit_pct || 0);
+                const pnlCls = pnl >= 0 ? 'text-emerald-300' : 'text-rose-300';
+                const seqText = item.seq_no ? `第${item.seq_no}单` : '--';
+                return `
+                    <div class="rounded-lg border px-2 py-1.5 ${cardCls}">
+                        <div class="flex items-center justify-between">
+                            <div class="font-medium">${escapeHtml(item.name || item.code || '')} <span class="text-[10px] opacity-75">${escapeHtml(item.code || '')}</span></div>
+                            <div class="text-[10px] opacity-80">${seqText} · ${escapeHtml(item.type || '')}</div>
+                        </div>
+                        <div class="mt-1 flex items-center justify-between text-[10px]">
+                            <span>现价 ¥${Number(item.current_price || 0).toFixed(2)} / 入场 ¥${Number(item.entry_price || 0).toFixed(2)}</span>
+                            <span class="${pnlCls}">净 ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}%</span>
+                        </div>
+                        <div class="mt-0.5 text-[10px] opacity-85">
+                            ${should ? '建议先手动平仓（未触发止盈/止损）' : '已接近触发条件或已触发，无需额外处理'}
+                        </div>
+                    </div>`;
+            }).join('');
+
+            const shouldNotify = (stage === 'warn' || stage === 'force');
+            if (shouldNotify) {
+                items.forEach(item => {
+                    if (!item.should_flatten || !item.signal_id) return;
+                    const key = `${stage}:${item.signal_id}`;
+                    if (preCloseNotifiedSignals.has(key)) return;
+                    preCloseNotifiedSignals.add(key);
+                    sendNotification(
+                        stage === 'force' ? '⏰ 强平窗口提醒' : '⏰ 尾盘平仓提醒',
+                        `${item.name || item.code} ${item.seq_no ? `第${item.seq_no}单` : ''} 建议优先平仓`
+                    );
+                });
+            }
+        }
+
         async function fetchStrategyPanels(force = false) {
             const now = Date.now();
             if (!force && now - strategyPanelLastFetchTs < 30000) return;
@@ -943,6 +1036,7 @@
                 const response = await fetch('/api/data');
                 const data = await response.json();
                 updateUI(data);
+                renderPreCloseAlerts(data.pre_close || {});
                 fetchStrategyPanels();
 
                 // 交易状态指示器

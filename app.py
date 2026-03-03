@@ -35,6 +35,7 @@ DB_PATH = os.path.join(DB_DIR, 'signals.db')
 DEBUG_LOG_DIR = os.path.join(DB_DIR, 'debug_logs')
 REPORT_DIR = os.path.join(DB_DIR, 'reports', 'daily')
 TUNING_DIR = os.path.join(DB_DIR, 'reports', 'tuning')
+BUNDLE_DIR = os.path.join(DB_DIR, 'reports', 'bundle')
 
 debug_log_lock = threading.RLock()
 
@@ -2175,6 +2176,284 @@ def get_daily_report_paths(target_date):
         'md': os.path.join(REPORT_DIR, f'{target_date}.md')
     }
 
+def get_daily_bundle_path(target_date):
+    os.makedirs(BUNDLE_DIR, exist_ok=True)
+    return os.path.join(BUNDLE_DIR, f'{target_date}.json')
+
+def get_signal_rows(date_from=None, date_to=None):
+    conn = get_db()
+    where = []
+    params = []
+    if date_from:
+        where.append('date >= ?')
+        params.append(date_from)
+    if date_to:
+        where.append('date <= ?')
+        params.append(date_to)
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ''
+    rows = conn.execute(
+        f'''
+        SELECT date, time, code, name, type, status, profit_pct
+        FROM signals
+        {where_sql}
+        ORDER BY date ASC, time ASC, created_at ASC
+        ''',
+        tuple(params)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def compute_slot_performance(days=1, end_date=None):
+    end_date = normalize_date_str(end_date, fallback_today=True)
+    if not end_date:
+        end_date = datetime.datetime.now().strftime('%Y-%m-%d')
+    try:
+        end_dt = datetime.datetime.strptime(end_date, '%Y-%m-%d').date()
+    except Exception:
+        end_dt = datetime.datetime.now().date()
+    days = max(1, min(int(days), 90))
+    start_dt = end_dt - datetime.timedelta(days=days - 1)
+
+    rows = get_signal_rows(date_from=start_dt.strftime('%Y-%m-%d'), date_to=end_dt.strftime('%Y-%m-%d'))
+    agg = collections.defaultdict(lambda: {'total': 0, 'success': 0, 'fail': 0, 'pending': 0, 'profit_sum': 0.0, 'profit_n': 0})
+    agg_type = collections.defaultdict(lambda: collections.defaultdict(lambda: {'total': 0, 'success': 0, 'fail': 0, 'pending': 0, 'profit_sum': 0.0, 'profit_n': 0}))
+
+    for r in rows:
+        slot = get_time_slot_label(r.get('time'))
+        st = agg[slot]
+        st_type = agg_type[slot][r.get('type', 'UNKNOWN')]
+
+        for target in (st, st_type):
+            target['total'] += 1
+            status = r.get('status')
+            if status == 'success':
+                target['success'] += 1
+                target['profit_sum'] += float(r.get('profit_pct') or 0.0)
+                target['profit_n'] += 1
+            elif status == 'fail':
+                target['fail'] += 1
+                target['profit_sum'] += float(r.get('profit_pct') or 0.0)
+                target['profit_n'] += 1
+            else:
+                target['pending'] += 1
+
+    slot_items = []
+    for slot, st in agg.items():
+        comp = st['success'] + st['fail']
+        by_type = {}
+        for sig_type, st_type in agg_type[slot].items():
+            c2 = st_type['success'] + st_type['fail']
+            by_type[sig_type] = {
+                'total': st_type['total'],
+                'success': st_type['success'],
+                'fail': st_type['fail'],
+                'pending': st_type['pending'],
+                'win_rate': round(st_type['success'] * 100.0 / c2, 2) if c2 else 0.0,
+                'avg_profit_pct': round(st_type['profit_sum'] / st_type['profit_n'], 4) if st_type['profit_n'] else 0.0
+            }
+        slot_items.append({
+            'slot': slot,
+            'total': st['total'],
+            'success': st['success'],
+            'fail': st['fail'],
+            'pending': st['pending'],
+            'win_rate': round(st['success'] * 100.0 / comp, 2) if comp else 0.0,
+            'avg_profit_pct': round(st['profit_sum'] / st['profit_n'], 4) if st['profit_n'] else 0.0,
+            'by_type': by_type
+        })
+    slot_items.sort(key=lambda x: x['total'], reverse=True)
+
+    return {
+        'date_range': {
+            'from': start_dt.strftime('%Y-%m-%d'),
+            'to': end_dt.strftime('%Y-%m-%d'),
+            'days': days
+        },
+        'items': slot_items
+    }
+
+def build_slot_hints(slot_perf):
+    hints = []
+    for item in slot_perf.get('items', []):
+        slot = item['slot']
+        total = int(item.get('total', 0))
+        wr = float(item.get('win_rate', 0.0))
+        buy = item.get('by_type', {}).get('BUY', {})
+        buy_total = int(buy.get('total', 0))
+        buy_wr = float(buy.get('win_rate', 0.0))
+        if total >= 6 and wr < 40:
+            hints.append({
+                'slot': slot,
+                'severity': 'warn',
+                'msg': f'{slot} 胜率偏低({wr:.1f}%)，建议提高时段阈值或降低仓位'
+            })
+        if buy_total >= 4 and buy_wr < 35:
+            hints.append({
+                'slot': slot,
+                'severity': 'warn',
+                'msg': f'{slot} BUY 胜率偏低({buy_wr:.1f}%)，建议上调 time_slot_templates.{slot}.buy_min_score'
+            })
+        if total >= 6 and wr >= 65:
+            hints.append({
+                'slot': slot,
+                'severity': 'info',
+                'msg': f'{slot} 胜率较高({wr:.1f}%)，可作为优先交易时段'
+            })
+    return hints
+
+def read_daily_bundle_json(target_date):
+    path = get_daily_bundle_path(target_date)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def get_latest_tuning_for_date(target_date):
+    os.makedirs(TUNING_DIR, exist_ok=True)
+    prefix = f"{target_date}_"
+    files = [f for f in os.listdir(TUNING_DIR) if f.startswith(prefix) and f.endswith('.json')]
+    if not files:
+        return None
+    files.sort(reverse=True)
+    path = os.path.join(TUNING_DIR, files[0])
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+        return {'path': path, 'payload': payload}
+    except Exception:
+        return {'path': path, 'payload': None}
+
+def generate_daily_bundle(target_date, trigger='manual'):
+    report, report_paths = get_or_generate_daily_report(target_date, trigger=f'bundle_{trigger}')
+    debug_entries = read_debug_log_entries(target_date, limit=50000)
+    debug_summary = summarize_debug_entries(debug_entries)
+    slot_perf = compute_slot_performance(days=1, end_date=target_date)
+    slot_hints = build_slot_hints(slot_perf)
+    latest_tuning = get_latest_tuning_for_date(target_date)
+
+    with state_lock:
+        runtime = {
+            'active_codes': list(active_stocks.keys()),
+            'strategy': get_strategy_snapshot(),
+            'risk': copy.deepcopy(risk_state),
+            'health': copy.deepcopy(health_state)
+        }
+
+    event_counts = debug_summary.get('event_counts', {})
+    health_brief = {
+        'worker_error': int(event_counts.get('worker_error', 0)),
+        'fetch_non_200': int(event_counts.get('fetch_non_200', 0)),
+        'signal_rejected': int(event_counts.get('signal_rejected', 0)),
+        'risk_guard_triggered': int(event_counts.get('risk_guard_triggered', 0))
+    }
+
+    bundle = {
+        'date': target_date,
+        'generated_at': datetime.datetime.now().isoformat(timespec='seconds'),
+        'trigger': trigger,
+        'report': report,
+        'report_paths': report_paths,
+        'debug_summary': debug_summary,
+        'health_brief': health_brief,
+        'slot_performance': slot_perf,
+        'slot_hints': slot_hints,
+        'latest_tuning': latest_tuning,
+        'runtime_snapshot': runtime
+    }
+    bundle_path = get_daily_bundle_path(target_date)
+    with open(bundle_path, 'w', encoding='utf-8') as f:
+        json.dump(bundle, f, ensure_ascii=False, indent=2)
+
+    log_debug_event(
+        'daily_bundle_generated',
+        {
+            'date': target_date,
+            'trigger': trigger,
+            'bundle_path': bundle_path
+        },
+        target_date=target_date
+    )
+    return bundle, bundle_path
+
+def build_preflight_assessment(ref_date=None, lookback_days=5):
+    ref_date = normalize_date_str(ref_date, fallback_today=True)
+    if not ref_date:
+        ref_date = datetime.datetime.now().strftime('%Y-%m-%d')
+    lookback_days = max(1, min(int(lookback_days), 30))
+
+    conn = get_db()
+    rows = conn.execute(
+        '''
+        SELECT date, total, success, fail, win_rate
+        FROM daily_stats
+        WHERE date<=?
+        ORDER BY date DESC
+        LIMIT ?
+        ''',
+        (ref_date, lookback_days)
+    ).fetchall()
+    conn.close()
+
+    days = [dict(r) for r in rows]
+    total_completed = sum(int(d.get('success', 0)) + int(d.get('fail', 0)) for d in days)
+    total_success = sum(int(d.get('success', 0)) for d in days)
+    weighted_wr = round(total_success * 100.0 / total_completed, 2) if total_completed > 0 else 0.0
+    worst_day_wr = min((float(d.get('win_rate') or 0.0) for d in days), default=0.0)
+
+    slot_perf = compute_slot_performance(days=min(lookback_days, 10), end_date=ref_date)
+    slot_hints = build_slot_hints(slot_perf)
+    paused, left_sec, reason = is_risk_paused()
+    update_health_alerts()
+    with state_lock:
+        alerts = list(health_state.get('alerts', []))
+
+    level = 'green'
+    checklist = []
+    if total_completed < 20:
+        level = 'yellow'
+        checklist.append('近几日有效样本较少，建议继续以模拟为主')
+    if weighted_wr < 45:
+        level = 'red'
+        checklist.append(f'近{lookback_days}日加权胜率偏低({weighted_wr:.1f}%)，不建议直接放大实盘')
+    elif weighted_wr < 52 and level != 'red':
+        level = 'yellow'
+        checklist.append(f'近{lookback_days}日加权胜率一般({weighted_wr:.1f}%)，建议先小资金验证')
+    if worst_day_wr < 35:
+        level = 'red'
+        checklist.append(f'存在极弱交易日(最低日胜率 {worst_day_wr:.1f}%)，应先优化时段模板')
+    if paused:
+        level = 'red'
+        checklist.append(f'风控总闸仍在暂停中({left_sec:.0f}s, {reason})')
+    if alerts and level == 'green':
+        level = 'yellow'
+    if alerts:
+        checklist.append(f'运行健康告警 {len(alerts)} 条，建议先排查数据质量')
+    if not checklist:
+        checklist.append('近几日状态稳定，可进入小仓位实盘观察阶段')
+
+    return {
+        'as_of': ref_date,
+        'lookback_days': lookback_days,
+        'level': level,
+        'metrics': {
+            'completed': total_completed,
+            'weighted_win_rate': weighted_wr,
+            'worst_day_win_rate': round(worst_day_wr, 2)
+        },
+        'daily_stats': days,
+        'slot_hints': slot_hints,
+        'health_alerts': alerts,
+        'risk_pause': {
+            'paused': paused,
+            'left_sec': round(left_sec, 2),
+            'reason': reason
+        },
+        'checklist': checklist
+    }
+
 def generate_daily_report(target_date, trigger='manual'):
     conn = get_db()
     rows = conn.execute(
@@ -2618,6 +2897,26 @@ def maybe_auto_generate_daily_report():
         return
 
     generate_daily_report(target_date, trigger='auto_after_close')
+    try:
+        baseline = get_default_baseline_date(target_date)
+        suggestion = build_param_suggestion(target_date, baseline_date=baseline)
+        suggestion_path = save_tuning_suggestion(suggestion)
+        log_debug_event(
+            'tuning_suggested_auto',
+            {
+                'date': target_date,
+                'baseline_date': baseline,
+                'path': suggestion_path,
+                'proposed_patch': suggestion.get('proposed_patch', {})
+            },
+            target_date=target_date
+        )
+    except Exception as e:
+        log_debug_event('tuning_suggested_auto_failed', {'date': target_date, 'error': str(e)}, target_date=target_date)
+    try:
+        generate_daily_bundle(target_date, trigger='auto_after_close')
+    except Exception as e:
+        log_debug_event('daily_bundle_auto_failed', {'date': target_date, 'error': str(e)}, target_date=target_date)
     last_auto_report_date = target_date
 
 @app.route('/api/debug/logs')
@@ -2703,6 +3002,39 @@ def api_list_daily_reports():
         })
     return jsonify({'success': True, 'items': items})
 
+@app.route('/api/reports/daily/bundle')
+def api_get_daily_bundle():
+    date_q = normalize_date_str(request.args.get('date'), fallback_today=True)
+    if not date_q:
+        return jsonify({'success': False, 'msg': 'invalid date, expected YYYY-MM-DD'})
+
+    generate_if_missing = to_bool(request.args.get('generate', '1'))
+    bundle = read_daily_bundle_json(date_q)
+    path = get_daily_bundle_path(date_q)
+    if bundle is None and generate_if_missing:
+        bundle, path = generate_daily_bundle(date_q, trigger='api_get_bundle')
+
+    return jsonify({
+        'success': bundle is not None,
+        'date': date_q,
+        'bundle': bundle,
+        'path': path
+    })
+
+@app.route('/api/reports/daily/bundle/generate', methods=['POST'])
+def api_generate_daily_bundle():
+    data = request.get_json(silent=True) or {}
+    date_q = normalize_date_str(data.get('date'), fallback_today=True)
+    if not date_q:
+        return jsonify({'success': False, 'msg': 'invalid date, expected YYYY-MM-DD'})
+    bundle, path = generate_daily_bundle(date_q, trigger='api_manual_bundle')
+    return jsonify({
+        'success': True,
+        'date': date_q,
+        'bundle': bundle,
+        'path': path
+    })
+
 @app.route('/api/reports/daily/compare')
 def api_compare_daily_reports():
     date_q = normalize_date_str(request.args.get('date'), fallback_today=True)
@@ -2739,6 +3071,27 @@ def api_compare_daily_reports():
         'current_paths': get_daily_report_paths(date_q),
         'baseline_paths': get_daily_report_paths(baseline_q)
     })
+
+@app.route('/api/preflight')
+def api_preflight():
+    try:
+        lookback = int(request.args.get('lookback', 5))
+    except Exception:
+        lookback = 5
+    date_q = request.args.get('date')
+    assessment = build_preflight_assessment(ref_date=date_q, lookback_days=lookback)
+    return jsonify({'success': True, 'assessment': assessment})
+
+@app.route('/api/analytics/slot-performance')
+def api_slot_performance():
+    try:
+        days = int(request.args.get('days', 10))
+    except Exception:
+        days = 10
+    end_date = request.args.get('date')
+    perf = compute_slot_performance(days=days, end_date=end_date)
+    hints = build_slot_hints(perf)
+    return jsonify({'success': True, 'performance': perf, 'hints': hints})
 
 @app.route('/api/tuning/suggest')
 def api_tuning_suggest():

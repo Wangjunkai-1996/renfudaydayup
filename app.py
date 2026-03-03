@@ -28,6 +28,8 @@ app = Flask(__name__)
 
 HEADERS = {'Referer': 'http://finance.sina.com.cn'}
 MAX_STOCKS = 3
+MARKET_CLOSE_MINUTE = 15 * 60
+PRE_CLOSE_FLATTEN_MINUTE = 14 * 60 + 57
 
 # === SQLite 持久化 ===
 DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
@@ -50,7 +52,7 @@ STRATEGY_BOOL_KEYS = (
 STRATEGY_FLOAT_KEYS = (
     'win_threshold', 'loss_threshold',
     'buy_min_score', 'sell_min_score', 'buy_pause_min_wr',
-    'risk_daily_profit_floor', 'regime_target_wr'
+    'risk_daily_profit_floor', 'regime_target_wr', 'trade_cost_buffer'
 )
 STRATEGY_INT_KEYS = (
     'buy_pause_window', 'buy_pause_min_samples',
@@ -73,7 +75,8 @@ DEFAULT_TIME_SLOT_TEMPLATES = {
 
 UNIT_INTERVAL_FLOAT_KEYS = {
     'win_threshold', 'loss_threshold',
-    'buy_min_score', 'sell_min_score', 'buy_pause_min_wr', 'regime_target_wr'
+    'buy_min_score', 'sell_min_score', 'buy_pause_min_wr', 'regime_target_wr',
+    'trade_cost_buffer'
 }
 
 SIGNED_FLOAT_KEYS = {
@@ -303,6 +306,7 @@ def init_db():
             id TEXT PRIMARY KEY,
             date TEXT,
             time TEXT,
+            seq_no INTEGER DEFAULT 0,
             code TEXT,
             name TEXT,
             type TEXT,
@@ -314,12 +318,18 @@ def init_db():
             resolved_at TIMESTAMP
         )
     ''')
-    try:
-        conn.execute('ALTER TABLE signals ADD COLUMN resolved_price REAL DEFAULT 0.0')
-        conn.execute('ALTER TABLE signals ADD COLUMN profit_pct REAL DEFAULT 0.0')
-        conn.execute('ALTER TABLE signals ADD COLUMN resolve_msg TEXT DEFAULT ""')
-    except:
-        pass
+    alter_sqls = [
+        'ALTER TABLE signals ADD COLUMN seq_no INTEGER DEFAULT 0',
+        'ALTER TABLE signals ADD COLUMN resolved_price REAL DEFAULT 0.0',
+        'ALTER TABLE signals ADD COLUMN gross_profit_pct REAL DEFAULT 0.0',
+        'ALTER TABLE signals ADD COLUMN profit_pct REAL DEFAULT 0.0',
+        'ALTER TABLE signals ADD COLUMN resolve_msg TEXT DEFAULT ""'
+    ]
+    for sql in alter_sqls:
+        try:
+            conn.execute(sql)
+        except Exception:
+            pass
     conn.execute('''
         CREATE TABLE IF NOT EXISTS daily_stats (
             date TEXT PRIMARY KEY,
@@ -377,8 +387,8 @@ def db_save_signal(sig):
         conn = get_db()
         signal_date = sig.get('date') or datetime.datetime.now().strftime('%Y-%m-%d')
         conn.execute(
-            'INSERT OR REPLACE INTO signals (id, date, time, code, name, type, level, price, desc, status) VALUES (?,?,?,?,?,?,?,?,?,?)',
-            (sig['id'], signal_date, sig.get('time',''), sig.get('code',''), sig.get('name',''),
+            'INSERT OR REPLACE INTO signals (id, date, time, seq_no, code, name, type, level, price, desc, status) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+            (sig['id'], signal_date, sig.get('time',''), int(sig.get('seq_no') or 0), sig.get('code',''), sig.get('name',''),
              sig['type'], sig.get('level',0), sig['price'], sig.get('desc',''), sig.get('status','pending'))
         )
         # 更新当日统计
@@ -389,7 +399,16 @@ def db_save_signal(sig):
     except Exception as e:
         print(f'db save error: {e}')
 
-def db_resolve_signal(sig_id, status, resolved_price=0.0, profit_pct=0.0, resolve_msg='', signal_date=None):
+def get_next_signal_seq(code, signal_date):
+    conn = get_db()
+    row = conn.execute(
+        'SELECT COALESCE(MAX(seq_no), 0) AS m FROM signals WHERE code=? AND date=?',
+        (code, signal_date)
+    ).fetchone()
+    conn.close()
+    return int(row['m'] or 0) + 1
+
+def db_resolve_signal(sig_id, status, resolved_price=0.0, gross_profit_pct=0.0, profit_pct=0.0, resolve_msg='', signal_date=None):
     try:
         conn = get_db()
         target_date = signal_date
@@ -398,8 +417,10 @@ def db_resolve_signal(sig_id, status, resolved_price=0.0, profit_pct=0.0, resolv
             target_date = row['date'] if row and row['date'] else datetime.datetime.now().strftime('%Y-%m-%d')
 
         conn.execute('INSERT OR IGNORE INTO daily_stats (date) VALUES (?)', (target_date,))
-        conn.execute('UPDATE signals SET status=?, resolved_at=CURRENT_TIMESTAMP, resolved_price=?, profit_pct=?, resolve_msg=? WHERE id=?', 
-                     (status, resolved_price, profit_pct, resolve_msg, sig_id))
+        conn.execute(
+            'UPDATE signals SET status=?, resolved_at=CURRENT_TIMESTAMP, resolved_price=?, gross_profit_pct=?, profit_pct=?, resolve_msg=? WHERE id=?',
+            (status, resolved_price, gross_profit_pct, profit_pct, resolve_msg, sig_id)
+        )
         if status == 'success':
             conn.execute('UPDATE daily_stats SET success = success + 1 WHERE date = ?', (target_date,))
         elif status == 'fail':
@@ -425,10 +446,11 @@ def load_today_signals():
         conn.close()
         restored = []
         for r in rows:
-            sig = {'id': r['id'], 'date': r['date'], 'time': r['time'], 'code': r['code'], 'name': r['name'],
+            sig = {'id': r['id'], 'date': r['date'], 'time': r['time'], 'seq_no': r['seq_no'] if 'seq_no' in r.keys() else 0, 'code': r['code'], 'name': r['name'],
                    'type': r['type'], 'level': r['level'], 'price': r['price'],
                    'desc': r['desc'], 'status': r['status'],
                    'resolved_price': r['resolved_price'] if 'resolved_price' in r.keys() else 0.0,
+                   'gross_profit_pct': r['gross_profit_pct'] if 'gross_profit_pct' in r.keys() else (r['profit_pct'] if 'profit_pct' in r.keys() else 0.0),
                    'profit_pct': r['profit_pct'] if 'profit_pct' in r.keys() else 0.0,
                    'resolve_msg': r['resolve_msg'] if 'resolve_msg' in r.keys() else ''}
             restored.append(sig)
@@ -446,7 +468,7 @@ analyzers = {}      # {'sh600079': DayTradeAnalyzer()}
 signals_history = []# 所有股票的信号流
 pending_signals = []# 正在等待出止盈/止损的信号
 success_rates = {
-    'total': 0, 'success': 0, 'fail': 0, 'pending': 0,
+    'total': 0, 'success': 0, 'fail': 0, 'flat': 0, 'pending': 0,
     'win_threshold': 0.010, 'loss_threshold': 0.008,
     # BUY/SELL 分离过滤参数（默认对 BUY 更严格）
     'buy_min_score': 0.58, 'sell_min_score': 0.55,
@@ -464,6 +486,8 @@ success_rates = {
     'risk_max_consecutive_fail': 4,
     'risk_daily_profit_floor': -2.0,
     'risk_pause_minutes': 30,
+    # 成本缓冲（净收益判断）：毛收益需超过该比例才记为 success
+    'trade_cost_buffer': 0.0012,
     # 仅在高质量策略窗口开仓，目标胜率保守设为 75%
     'regime_filter_enabled': True,
     'regime_target_wr': 0.75,
@@ -510,12 +534,19 @@ health_state = {
 quality_cache = {}  # key -> {'ts': float, 'value': {...}}
 
 def is_trading_time():
-    """A股交易时段检测：工作日 9:30-11:30, 13:00-15:30"""
+    """A股交易时段检测：工作日 9:30-11:30, 13:00-15:00"""
     now = datetime.datetime.now()
     if now.weekday() >= 5:  # 周末
         return False
     t = now.hour * 60 + now.minute
-    return (9*60+30 <= t <= 11*60+30) or (13*60 <= t <= 15 * 60 + 30)
+    return (9*60+30 <= t <= 11*60+30) or (13*60 <= t <= MARKET_CLOSE_MINUTE)
+
+def is_pre_close_window(now=None):
+    dt = now or datetime.datetime.now()
+    if dt.weekday() >= 5:
+        return False
+    m = dt.hour * 60 + dt.minute
+    return PRE_CLOSE_FLATTEN_MINUTE <= m <= MARKET_CLOSE_MINUTE
 
 def parse_signal_score(desc):
     m = re.search(r'评分:(\d+)%', desc or '')
@@ -545,7 +576,7 @@ def get_time_slot_label(time_str=None):
         return 'afternoon_open'
     if 13 * 60 + 30 <= m < 14 * 60 + 30:
         return 'afternoon'
-    if 14 * 60 + 30 <= m <= 15 * 60 + 30:
+    if 14 * 60 + 30 <= m <= MARKET_CLOSE_MINUTE:
         return 'close'
     return 'off_hours'
 
@@ -746,6 +777,28 @@ def record_buy_outcome(code, is_success):
             buy_outcomes[code] = dq
         dq.append(1 if is_success else 0)
 
+def classify_trade_result(sig_type, entry_price, current_price):
+    """
+    统一收益判定（按净收益）：
+    - gross_return: 毛收益率（小数，如 0.01 = +1%）
+    - net_return: 扣除 trade_cost_buffer 后的净收益率
+    - final: success / fail
+    """
+    entry = float(entry_price or 0.0)
+    cur = float(current_price or 0.0)
+    if entry <= 0:
+        return 0.0, 0.0, 'fail'
+
+    with state_lock:
+        cost_buffer = float(success_rates.get('trade_cost_buffer', 0.0012))
+    if str(sig_type) == 'BUY':
+        gross_return = (cur - entry) / entry
+    else:
+        gross_return = (entry - cur) / entry
+    net_return = gross_return - cost_buffer
+    final = 'success' if net_return >= 0 else 'fail'
+    return gross_return, net_return, final
+
 def get_recent_regime_quality(code, sig_type, slot, lookback_days=10):
     """
     计算最近 lookback_days 的信号质量：
@@ -886,6 +939,13 @@ def should_accept_signal(code, sig):
         }
         return False, reasons, meta
 
+    if is_pre_close_window():
+        reasons.append('pre_close_no_new_position')
+        return False, reasons, {
+            'signal_type': sig_type,
+            'slot': effective.get('slot')
+        }
+
     regime_ok, regime_reasons, regime_meta = evaluate_regime_gate(code, sig, effective)
     if not regime_ok:
         reasons.extend(regime_reasons)
@@ -946,23 +1006,24 @@ def should_accept_signal(code, sig):
 
     return False, ['unknown_signal_type'], {'signal_type': sig_type}
 
-def resolve_pending_after_market_close():
-    """收盘后强制平掉未完成信号，避免跨日悬挂污染统计。"""
+def resolve_pending_after_market_close(force_today=False):
+    """收盘前/收盘后强制平掉未完成信号，避免跨日悬挂污染统计。"""
     now = datetime.datetime.now()
     today = now.strftime('%Y-%m-%d')
 
-    # 仅在交易日收盘后，或非交易日时处理历史遗留 pending。
-    after_close = (now.weekday() < 5) and (now.hour > 15 or (now.hour == 15 and now.minute >= 31))
+    # 交易日收盘后，或非交易日处理历史遗留；force_today 用于 14:57 前置平仓。
+    after_close = (now.weekday() < 5) and ((now.hour * 60 + now.minute) > MARKET_CLOSE_MINUTE)
     non_trading = not is_trading_time()
-    if not (after_close or non_trading):
+    if not (force_today or after_close or non_trading):
         return
 
     db_updates = []
     debug_events = []
+    phase = 'pre_close' if force_today else ('after_close' if after_close else 'non_trading')
     with state_lock:
         for sig in pending_signals[:]:
             sig_date = sig.get('date', today)
-            is_stale = sig_date < today or after_close
+            is_stale = sig_date < today or after_close or (force_today and sig_date == today)
             if not is_stale:
                 continue
 
@@ -972,16 +1033,15 @@ def resolve_pending_after_market_close():
             if data_list:
                 cp = data_list[-1].get('price', cp)
 
-            if sig['type'] == 'BUY':
-                profit_pct = ((cp - sig['price']) / sig['price']) if sig['price'] else 0.0
-            else:
-                profit_pct = ((sig['price'] - cp) / sig['price']) if sig['price'] else 0.0
-
-            final = 'success' if profit_pct >= 0 else 'fail'
+            gross_return, net_return, final = classify_trade_result(sig.get('type'), sig.get('price', 0.0), cp)
             sig['status'] = final
             sig['resolved_price'] = cp
-            sig['profit_pct'] = profit_pct * 100
-            sig['resolve_msg'] = f"⏰ 收盘强制平仓 ({sig['profit_pct']:+.2f}%)"
+            sig['gross_profit_pct'] = gross_return * 100
+            sig['profit_pct'] = net_return * 100
+            sig['resolve_msg'] = (
+                f"⏰ {'收盘前强制平仓' if force_today else '收盘强制平仓'} "
+                f"(净{sig['profit_pct']:+.2f}% / 毛{sig['gross_profit_pct']:+.2f}%)"
+            )
             hold_sec = None
             if sig.get('entry_ts'):
                 hold_sec = max(0.0, time.time() - float(sig['entry_ts']))
@@ -995,10 +1055,11 @@ def resolve_pending_after_market_close():
             update_risk_state_on_resolution(sig, final)
 
             pending_signals.remove(sig)
-            db_updates.append((sig['id'], final, cp, sig['profit_pct'], sig['resolve_msg'], sig_date))
+            db_updates.append((sig['id'], final, cp, sig['gross_profit_pct'], sig['profit_pct'], sig['resolve_msg'], sig_date))
             debug_events.append({
                 'event': 'signal_force_closed',
                 'date': sig_date,
+                'phase': phase,
                 'time': sig.get('time', ''),
                 'signal_id': sig.get('id', ''),
                 'code': code,
@@ -1007,6 +1068,7 @@ def resolve_pending_after_market_close():
                 'status': final,
                 'entry_price': sig.get('price', 0.0),
                 'resolved_price': cp,
+                'gross_profit_pct': sig['gross_profit_pct'],
                 'profit_pct': sig['profit_pct'],
                 'hold_sec': round(hold_sec, 2) if hold_sec is not None else None,
                 'resolve_msg': sig['resolve_msg'],
@@ -1015,8 +1077,8 @@ def resolve_pending_after_market_close():
 
         success_rates['pending'] = len(pending_signals)
 
-    for sig_id, final, cp, profit_pct, msg, sig_date in db_updates:
-        db_resolve_signal(sig_id, final, cp, profit_pct, msg, signal_date=sig_date)
+    for sig_id, final, cp, gross_profit_pct, profit_pct, msg, sig_date in db_updates:
+        db_resolve_signal(sig_id, final, cp, gross_profit_pct, profit_pct, msg, signal_date=sig_date)
     for e in debug_events:
         log_debug_event(e.pop('event'), e, target_date=e.get('date'))
 
@@ -1654,13 +1716,13 @@ def fetch_worker():
 
         # 非交易时段自动休眠（节省网络资源）
         if not is_trading_time():
-            with state_lock:
-                close_pending = bool(success_rates.get('close_pending_after_market', True))
-            if close_pending:
-                resolve_pending_after_market_close()
+            resolve_pending_after_market_close()
             maybe_auto_generate_daily_report()
             time.sleep(30)
             continue
+
+        if is_pre_close_window():
+            resolve_pending_after_market_close(force_today=True)
             
         try:
             with state_lock:
@@ -1798,6 +1860,8 @@ def fetch_worker():
                                 )
                                 continue
 
+                            signal_seq_no = get_next_signal_seq(code, base_payload['date'])
+
                             with state_lock:
                                 # 入库前再做一次并发态校验
                                 if code not in active_stocks:
@@ -1809,6 +1873,7 @@ def fetch_worker():
                                 new_sig['date'] = base_payload['date']
                                 new_sig['code'] = code
                                 new_sig['name'] = active_stocks[code]
+                                new_sig['seq_no'] = signal_seq_no
                                 new_sig['entry_ts'] = now_ts
 
                                 signals_history.insert(0, new_sig)
@@ -1825,6 +1890,7 @@ def fetch_worker():
                                     {
                                         **base_payload,
                                         'signal_id': new_sig.get('id'),
+                                        'seq_no': new_sig.get('seq_no'),
                                         'filter_meta': filter_meta,
                                         'strategy': get_strategy_snapshot()
                                     },
@@ -1865,41 +1931,12 @@ def fetch_worker():
                                 sig['stop_price'] = max(sig['stop_price'], sig['price'] * 1.001)
 
                             if cp >= sig['price'] * (1 + win_threshold):
-                                sig['status'] = 'success'
+                                gross_return, net_return, final = classify_trade_result(sig.get('type'), sig.get('price', 0.0), cp)
+                                sig['status'] = final
                                 sig['resolved_price'] = cp
-                                sig['profit_pct'] = profit_pct * 100
-                                sig['resolve_msg'] = f"🎯 止盈平仓 (收益 +{sig['profit_pct']:.2f}%)"
-                                success_rates['success'] += 1
-                                if code not in success_rates['stocks']:
-                                    success_rates['stocks'][code] = {'success': 0, 'fail': 0}
-                                success_rates['stocks'][code]['success'] += 1
-                                if sig['type'] == 'BUY':
-                                    record_buy_outcome(code, True)
-                                update_risk_state_on_resolution(sig, 'success')
-                                pending_signals.remove(sig)
-                                db_updates.append((sig['id'], 'success', cp, sig['profit_pct'], sig['resolve_msg'], sig.get('date')))
-                                debug_events.append({
-                                    'event': 'signal_resolved',
-                                    'date': sig.get('date'),
-                                    'time': sig.get('time', ''),
-                                    'signal_id': sig.get('id', ''),
-                                    'code': code,
-                                    'name': sig.get('name', ''),
-                                    'signal_type': sig.get('type', ''),
-                                    'status': 'success',
-                                    'entry_price': sig.get('price', 0.0),
-                                    'resolved_price': cp,
-                                    'profit_pct': sig['profit_pct'],
-                                    'hold_sec': round(hold_sec, 2) if hold_sec is not None else None,
-                                    'resolve_msg': sig.get('resolve_msg', ''),
-                                    'strategy': get_strategy_snapshot()
-                                })
-                            elif cp <= sig['stop_price']:
-                                sig['status'] = 'fail' if cp < sig['price'] else 'success'
-                                final = 'success' if cp >= sig['price'] else 'fail'
-                                sig['resolved_price'] = cp
-                                sig['profit_pct'] = profit_pct * 100
-                                sig['resolve_msg'] = f"🛡️ 止损/保本平仓 (滑差 {sig['profit_pct']:.2f}%)"
+                                sig['gross_profit_pct'] = gross_return * 100
+                                sig['profit_pct'] = net_return * 100
+                                sig['resolve_msg'] = f"🎯 止盈平仓 (净{sig['profit_pct']:+.2f}% / 毛{sig['gross_profit_pct']:+.2f}%)"
                                 success_rates[final] += 1
                                 if code not in success_rates['stocks']:
                                     success_rates['stocks'][code] = {'success': 0, 'fail': 0}
@@ -1908,7 +1945,7 @@ def fetch_worker():
                                     record_buy_outcome(code, final == 'success')
                                 update_risk_state_on_resolution(sig, final)
                                 pending_signals.remove(sig)
-                                db_updates.append((sig['id'], final, cp, sig['profit_pct'], sig['resolve_msg'], sig.get('date')))
+                                db_updates.append((sig['id'], final, cp, sig['gross_profit_pct'], sig['profit_pct'], sig['resolve_msg'], sig.get('date')))
                                 debug_events.append({
                                     'event': 'signal_resolved',
                                     'date': sig.get('date'),
@@ -1920,6 +1957,40 @@ def fetch_worker():
                                     'status': final,
                                     'entry_price': sig.get('price', 0.0),
                                     'resolved_price': cp,
+                                    'gross_profit_pct': sig['gross_profit_pct'],
+                                    'profit_pct': sig['profit_pct'],
+                                    'hold_sec': round(hold_sec, 2) if hold_sec is not None else None,
+                                    'resolve_msg': sig.get('resolve_msg', ''),
+                                    'strategy': get_strategy_snapshot()
+                                })
+                            elif cp <= sig['stop_price']:
+                                gross_return, net_return, final = classify_trade_result(sig.get('type'), sig.get('price', 0.0), cp)
+                                sig['status'] = final
+                                sig['resolved_price'] = cp
+                                sig['gross_profit_pct'] = gross_return * 100
+                                sig['profit_pct'] = net_return * 100
+                                sig['resolve_msg'] = f"🛡️ 止损/保本平仓 (净{sig['profit_pct']:+.2f}% / 毛{sig['gross_profit_pct']:+.2f}%)"
+                                success_rates[final] += 1
+                                if code not in success_rates['stocks']:
+                                    success_rates['stocks'][code] = {'success': 0, 'fail': 0}
+                                success_rates['stocks'][code][final] += 1
+                                if sig['type'] == 'BUY':
+                                    record_buy_outcome(code, final == 'success')
+                                update_risk_state_on_resolution(sig, final)
+                                pending_signals.remove(sig)
+                                db_updates.append((sig['id'], final, cp, sig['gross_profit_pct'], sig['profit_pct'], sig['resolve_msg'], sig.get('date')))
+                                debug_events.append({
+                                    'event': 'signal_resolved',
+                                    'date': sig.get('date'),
+                                    'time': sig.get('time', ''),
+                                    'signal_id': sig.get('id', ''),
+                                    'code': code,
+                                    'name': sig.get('name', ''),
+                                    'signal_type': sig.get('type', ''),
+                                    'status': final,
+                                    'entry_price': sig.get('price', 0.0),
+                                    'resolved_price': cp,
+                                    'gross_profit_pct': sig['gross_profit_pct'],
                                     'profit_pct': sig['profit_pct'],
                                     'hold_sec': round(hold_sec, 2) if hold_sec is not None else None,
                                     'resolve_msg': sig.get('resolve_msg', ''),
@@ -1938,46 +2009,19 @@ def fetch_worker():
                                 sig['stop_price'] = min(sig['stop_price'], sig['price'] * 0.999)
 
                             if cp <= sig['price'] * (1 - win_threshold):
-                                sig['status'] = 'success'
+                                gross_return, net_return, final = classify_trade_result(sig.get('type'), sig.get('price', 0.0), cp)
+                                sig['status'] = final
                                 sig['resolved_price'] = cp
-                                sig['profit_pct'] = profit_pct * 100
-                                sig['resolve_msg'] = f"🎯 止盈平仓 (收益 +{sig['profit_pct']:.2f}%)"
-                                success_rates['success'] += 1
-                                if code not in success_rates['stocks']:
-                                    success_rates['stocks'][code] = {'success': 0, 'fail': 0}
-                                success_rates['stocks'][code]['success'] += 1
-                                update_risk_state_on_resolution(sig, 'success')
-                                pending_signals.remove(sig)
-                                db_updates.append((sig['id'], 'success', cp, sig['profit_pct'], sig['resolve_msg'], sig.get('date')))
-                                debug_events.append({
-                                    'event': 'signal_resolved',
-                                    'date': sig.get('date'),
-                                    'time': sig.get('time', ''),
-                                    'signal_id': sig.get('id', ''),
-                                    'code': code,
-                                    'name': sig.get('name', ''),
-                                    'signal_type': sig.get('type', ''),
-                                    'status': 'success',
-                                    'entry_price': sig.get('price', 0.0),
-                                    'resolved_price': cp,
-                                    'profit_pct': sig['profit_pct'],
-                                    'hold_sec': round(hold_sec, 2) if hold_sec is not None else None,
-                                    'resolve_msg': sig.get('resolve_msg', ''),
-                                    'strategy': get_strategy_snapshot()
-                                })
-                            elif cp >= sig['stop_price']:
-                                sig['status'] = 'fail' if cp > sig['price'] else 'success'
-                                final = 'success' if cp <= sig['price'] else 'fail'
-                                sig['resolved_price'] = cp
-                                sig['profit_pct'] = profit_pct * 100
-                                sig['resolve_msg'] = f"🛡️ 止损/保本平仓 (滑差 {sig['profit_pct']:.2f}%)"
+                                sig['gross_profit_pct'] = gross_return * 100
+                                sig['profit_pct'] = net_return * 100
+                                sig['resolve_msg'] = f"🎯 止盈平仓 (净{sig['profit_pct']:+.2f}% / 毛{sig['gross_profit_pct']:+.2f}%)"
                                 success_rates[final] += 1
                                 if code not in success_rates['stocks']:
                                     success_rates['stocks'][code] = {'success': 0, 'fail': 0}
                                 success_rates['stocks'][code][final] += 1
                                 update_risk_state_on_resolution(sig, final)
                                 pending_signals.remove(sig)
-                                db_updates.append((sig['id'], final, cp, sig['profit_pct'], sig['resolve_msg'], sig.get('date')))
+                                db_updates.append((sig['id'], final, cp, sig['gross_profit_pct'], sig['profit_pct'], sig['resolve_msg'], sig.get('date')))
                                 debug_events.append({
                                     'event': 'signal_resolved',
                                     'date': sig.get('date'),
@@ -1989,6 +2033,38 @@ def fetch_worker():
                                     'status': final,
                                     'entry_price': sig.get('price', 0.0),
                                     'resolved_price': cp,
+                                    'gross_profit_pct': sig['gross_profit_pct'],
+                                    'profit_pct': sig['profit_pct'],
+                                    'hold_sec': round(hold_sec, 2) if hold_sec is not None else None,
+                                    'resolve_msg': sig.get('resolve_msg', ''),
+                                    'strategy': get_strategy_snapshot()
+                                })
+                            elif cp >= sig['stop_price']:
+                                gross_return, net_return, final = classify_trade_result(sig.get('type'), sig.get('price', 0.0), cp)
+                                sig['status'] = final
+                                sig['resolved_price'] = cp
+                                sig['gross_profit_pct'] = gross_return * 100
+                                sig['profit_pct'] = net_return * 100
+                                sig['resolve_msg'] = f"🛡️ 止损/保本平仓 (净{sig['profit_pct']:+.2f}% / 毛{sig['gross_profit_pct']:+.2f}%)"
+                                success_rates[final] += 1
+                                if code not in success_rates['stocks']:
+                                    success_rates['stocks'][code] = {'success': 0, 'fail': 0}
+                                success_rates['stocks'][code][final] += 1
+                                update_risk_state_on_resolution(sig, final)
+                                pending_signals.remove(sig)
+                                db_updates.append((sig['id'], final, cp, sig['gross_profit_pct'], sig['profit_pct'], sig['resolve_msg'], sig.get('date')))
+                                debug_events.append({
+                                    'event': 'signal_resolved',
+                                    'date': sig.get('date'),
+                                    'time': sig.get('time', ''),
+                                    'signal_id': sig.get('id', ''),
+                                    'code': code,
+                                    'name': sig.get('name', ''),
+                                    'signal_type': sig.get('type', ''),
+                                    'status': final,
+                                    'entry_price': sig.get('price', 0.0),
+                                    'resolved_price': cp,
+                                    'gross_profit_pct': sig['gross_profit_pct'],
                                     'profit_pct': sig['profit_pct'],
                                     'hold_sec': round(hold_sec, 2) if hold_sec is not None else None,
                                     'resolve_msg': sig.get('resolve_msg', ''),
@@ -1997,8 +2073,8 @@ def fetch_worker():
 
                     success_rates['pending'] = len(pending_signals)
 
-                for sig_id, final_status, resolved_price, profit_pct, resolve_msg, sig_date in db_updates:
-                    db_resolve_signal(sig_id, final_status, resolved_price, profit_pct, resolve_msg, signal_date=sig_date)
+                for sig_id, final_status, resolved_price, gross_profit_pct, profit_pct, resolve_msg, sig_date in db_updates:
+                    db_resolve_signal(sig_id, final_status, resolved_price, gross_profit_pct, profit_pct, resolve_msg, signal_date=sig_date)
                 for e in debug_events:
                     log_debug_event(e.pop('event'), e, target_date=e.get('date'))
             else:
@@ -2601,7 +2677,7 @@ def generate_daily_report(target_date, trigger='manual'):
     conn = get_db()
     rows = conn.execute(
         '''
-        SELECT date, time, code, name, type, price, status, resolved_price, profit_pct, desc, resolve_msg, created_at, resolved_at
+        SELECT date, time, seq_no, code, name, type, price, status, resolved_price, gross_profit_pct, profit_pct, desc, resolve_msg, created_at, resolved_at
         FROM signals
         WHERE date=?
         ORDER BY time ASC, created_at ASC
@@ -3362,7 +3438,7 @@ def api_signal_explain(sig_id):
     conn = get_db()
     row = conn.execute(
         '''
-        SELECT id, date, time, code, name, type, level, price, desc, status, resolved_price, profit_pct, resolve_msg, created_at, resolved_at
+        SELECT id, date, time, seq_no, code, name, type, level, price, desc, status, resolved_price, gross_profit_pct, profit_pct, resolve_msg, created_at, resolved_at
         FROM signals
         WHERE id=?
         ''',

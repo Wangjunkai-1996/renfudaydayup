@@ -223,6 +223,20 @@
                             <div id="paper-orders" class="space-y-1 text-[11px] text-slate-300"></div>
                         </div>
                     </div>
+                    <div class="mt-3 border-t border-slate-700/50 pt-3">
+                        <div class="flex items-center justify-between mb-2">
+                            <div class="text-[11px] text-slate-400">底仓配置（金额 + 默认成本线）</div>
+                            <div class="flex gap-2">
+                                <button onclick="saveBaseConfigs(false)"
+                                    class="text-[11px] px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 border border-slate-600">保存配置</button>
+                                <button onclick="saveBaseConfigs(true)"
+                                    class="text-[11px] px-2 py-1 rounded bg-indigo-600 hover:bg-indigo-500 text-white border border-indigo-500/50">保存并重建底仓</button>
+                            </div>
+                        </div>
+                        <div id="paper-base-configs" class="space-y-1 text-[11px] text-slate-300">
+                            <div class="text-slate-500">数据加载中...</div>
+                        </div>
+                    </div>
                 </div>
 
                 <!-- Dynamic Charts Wrapper -->
@@ -288,6 +302,7 @@
         let strategyPanelLoading = false;
         let preCloseNotifiedSignals = new Set();
         let lastPreCloseStage = '';
+        let baseConfigDirty = false;
 
         // === 信号音效系统 (Web Audio API) ===
         function playSignalSound(type) {
@@ -1049,7 +1064,82 @@
             return Number(v || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
         }
 
-        function renderPaperPanel(paper) {
+        function renderBaseConfigEditor(baseConfigs, activeStocks, currentState) {
+            const box = document.getElementById('paper-base-configs');
+            if (!box) return;
+            if (baseConfigDirty) return;
+
+            const cfgMap = {};
+            (baseConfigs || []).forEach(c => { cfgMap[c.code] = c; });
+            const codes = new Set(Object.keys(activeStocks || {}));
+            (baseConfigs || []).forEach(c => codes.add(c.code));
+            const rows = Array.from(codes).sort();
+            if (!rows.length) {
+                box.innerHTML = '<div class="text-slate-500">暂无可配置股票</div>';
+                return;
+            }
+
+            box.innerHTML = rows.map(code => {
+                const cfg = cfgMap[code] || {};
+                const name = (activeStocks && activeStocks[code]) || cfg.name || code;
+                const amount = Number(cfg.base_amount || 0);
+                const cost = Number(cfg.base_cost_line || Number(((currentState || {})[code] || {}).price || 0));
+                const enabled = (cfg.enabled === undefined) ? true : !!cfg.enabled;
+                return `
+                    <div class="grid grid-cols-[1.2fr_1fr_1fr_0.7fr] gap-2 items-center bg-slate-900/60 border border-slate-700/50 rounded px-2 py-1.5">
+                        <div class="text-slate-200">${escapeHtml(name)} <span class="text-[10px] text-slate-500">${escapeHtml(code)}</span></div>
+                        <input id="base-amount-${code}" type="number" min="0" step="1000" value="${amount.toFixed(0)}"
+                            oninput="baseConfigDirty=true"
+                            class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-slate-200 text-[11px]" placeholder="底仓金额">
+                        <input id="base-cost-${code}" type="number" min="0" step="0.01" value="${cost > 0 ? cost.toFixed(2) : ''}"
+                            oninput="baseConfigDirty=true"
+                            class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-slate-200 text-[11px]" placeholder="成本线">
+                        <label class="text-[10px] text-slate-400 flex items-center gap-1">
+                            <input id="base-enabled-${code}" type="checkbox" ${enabled ? 'checked' : ''} onchange="baseConfigDirty=true">
+                            启用
+                        </label>
+                    </div>`;
+            }).join('');
+        }
+
+        async function saveBaseConfigs(reseed = false) {
+            const box = document.getElementById('paper-base-configs');
+            if (!box) return;
+            const rowEls = box.querySelectorAll('[id^=\"base-amount-\"]');
+            const items = [];
+            rowEls.forEach(el => {
+                const code = el.id.replace('base-amount-', '');
+                const amt = Number(document.getElementById(`base-amount-${code}`)?.value || 0);
+                const cost = Number(document.getElementById(`base-cost-${code}`)?.value || 0);
+                const enabled = !!document.getElementById(`base-enabled-${code}`)?.checked;
+                items.push({
+                    code,
+                    base_amount: Math.max(0, amt),
+                    base_cost_line: Math.max(0, cost),
+                    enabled
+                });
+            });
+            try {
+                const res = await fetch('/api/paper/base-config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ items, apply_seed: reseed, reseed })
+                });
+                const data = await res.json();
+                if (!data.success) {
+                    alert(data.msg || '保存底仓配置失败');
+                    return;
+                }
+                baseConfigDirty = false;
+                alert(reseed ? '底仓配置已保存并重建底仓' : '底仓配置已保存');
+                fetchData();
+            } catch (e) {
+                console.error('save base config error:', e);
+                alert('保存底仓配置失败');
+            }
+        }
+
+        function renderPaperPanel(paper, activeStocks, currentState) {
             const navEl = document.getElementById('paper-nav');
             const cashEl = document.getElementById('paper-cash');
             const mvEl = document.getElementById('paper-mv');
@@ -1069,6 +1159,7 @@
                 retBadgeEl.innerText = '--';
                 posEl.innerHTML = '<div class="text-slate-500">账户未初始化</div>';
                 orderEl.innerHTML = '<div class="text-slate-500">暂无订单</div>';
+                renderBaseConfigEditor([], activeStocks || {}, currentState || {});
                 return;
             }
 
@@ -1098,6 +1189,11 @@
                             <div class="text-[10px] text-slate-400 mt-0.5">
                                 持仓 ${p.total_qty} / 可卖 ${p.available_qty} · 成本 ${Number(p.avg_cost || 0).toFixed(2)} · 现价 ${Number(p.current_price || 0).toFixed(2)}
                             </div>
+                            ${p.base_enabled ? `
+                                <div class="text-[10px] text-slate-500 mt-0.5">
+                                    底仓 ${p.base_target_qty || 0} 股 · 默认成本线 ${Number(p.base_cost_line || 0).toFixed(2)} · 当前摊薄成本线 ${Number(p.effective_cost_line || 0).toFixed(2)}
+                                </div>
+                            ` : ''}
                         </div>`;
                 }).join('');
             }
@@ -1121,6 +1217,7 @@
                         </div>`;
                 }).join('');
             }
+            renderBaseConfigEditor(paper.base_configs || [], activeStocks || {}, currentState || {});
         }
 
         async function fetchStrategyPanels(force = false) {
@@ -1155,7 +1252,7 @@
                 const data = await response.json();
                 updateUI(data);
                 renderPreCloseAlerts(data.pre_close || {});
-                renderPaperPanel(data.paper || null);
+                renderPaperPanel(data.paper || null, data.active_stocks || {}, data.current || {});
                 fetchStrategyPanels();
 
                 // 交易状态指示器

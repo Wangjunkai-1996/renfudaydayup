@@ -26,11 +26,22 @@ nohup python3 app.py > "${LOG_PATH}" 2>&1 &
 NEW_PID=$!
 echo "${NEW_PID}" > "${PID_PATH}"
 
-sleep 1
-if lsof -nP -iTCP:${PORT} -sTCP:LISTEN >/dev/null 2>&1; then
+READY=0
+for _ in {1..20}; do
+  if lsof -nP -iTCP:${PORT} -sTCP:LISTEN >/dev/null 2>&1; then
+    READY=1
+    break
+  fi
+  sleep 0.5
+done
+
+if [[ "${READY}" -eq 1 ]]; then
   echo "Server restarted on port ${PORT}, pid=${NEW_PID}"
   echo "Log: ${LOG_PATH}"
 else
   echo "Server failed to start, check log: ${LOG_PATH}"
+  if [[ -f "${LOG_PATH}" ]]; then
+    tail -n 40 "${LOG_PATH}" || true
+  fi
   exit 1
 fi

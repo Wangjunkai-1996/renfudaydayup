@@ -401,6 +401,16 @@ def init_db():
             v TEXT NOT NULL
         )
     ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS paper_base_config (
+            code TEXT PRIMARY KEY,
+            name TEXT DEFAULT '',
+            base_amount REAL NOT NULL DEFAULT 0.0,
+            base_cost_line REAL NOT NULL DEFAULT 0.0,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
     conn.execute(
         'INSERT OR IGNORE INTO paper_account (id, starting_cash, cash, realized_pnl) VALUES (1, ?, ?, 0.0)',
         (PAPER_START_CASH, PAPER_START_CASH)
@@ -777,6 +787,153 @@ def get_trend_multiplier(side, trend_text):
         return 0.7
     return 1.0
 
+def calc_base_target_qty(base_amount, base_cost_line, lot_size):
+    amount = float(base_amount or 0.0)
+    cost_line = float(base_cost_line or 0.0)
+    if amount <= 0 or cost_line <= 0:
+        return 0
+    return round_lot_qty(amount / cost_line, lot_size)
+
+def get_base_config_map(conn=None):
+    close_conn = False
+    if conn is None:
+        conn = get_db()
+        close_conn = True
+    rows = conn.execute(
+        '''
+        SELECT code, name, base_amount, base_cost_line, enabled, updated_at
+        FROM paper_base_config
+        '''
+    ).fetchall()
+    if close_conn:
+        conn.close()
+    mapping = {}
+    for r in rows:
+        mapping[str(r['code'])] = {
+            'code': r['code'],
+            'name': r['name'],
+            'base_amount': float(r['base_amount'] or 0.0),
+            'base_cost_line': float(r['base_cost_line'] or 0.0),
+            'enabled': bool(int(r['enabled'] or 0)),
+            'updated_at': r['updated_at']
+        }
+    return mapping
+
+def list_base_configs():
+    return list(get_base_config_map().values())
+
+def upsert_base_config(code, name, base_amount, base_cost_line, enabled=True):
+    c = str(code or '').strip().lower()
+    if not c:
+        return False, 'missing code'
+    try:
+        amt = float(base_amount or 0.0)
+        cost = float(base_cost_line or 0.0)
+    except Exception:
+        return False, 'invalid amount or cost'
+    if amt < 0 or cost < 0:
+        return False, 'amount/cost must be >= 0'
+    conn = get_db()
+    existing = conn.execute('SELECT name FROM paper_base_config WHERE code=?', (c,)).fetchone()
+    final_name = str(name or '').strip()
+    if not final_name and existing:
+        final_name = str(existing['name'] or '')
+    if not final_name:
+        with state_lock:
+            final_name = str(active_stocks.get(c, ''))
+    conn.execute(
+        '''
+        INSERT OR REPLACE INTO paper_base_config
+        (code, name, base_amount, base_cost_line, enabled, updated_at)
+        VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)
+        ''',
+        (c, final_name, amt, cost, 1 if enabled else 0)
+    )
+    conn.commit()
+    conn.close()
+    return True, ''
+
+def seed_base_positions(reseed=False):
+    """
+    将“底仓配置”写入模拟账户：
+    - reseed=True: 清空现有仓位和订单，再按底仓重建
+    - reseed=False: 仅在无仓位时补齐底仓
+    """
+    with state_lock:
+        min_lot = int(success_rates.get('paper_min_lot', 100))
+
+    conn = get_db()
+    account = conn.execute('SELECT * FROM paper_account WHERE id=1').fetchone()
+    if not account:
+        conn.execute(
+            'INSERT OR REPLACE INTO paper_account (id, starting_cash, cash, realized_pnl) VALUES (1, ?, ?, 0.0)',
+            (PAPER_START_CASH, PAPER_START_CASH)
+        )
+        conn.commit()
+        account = conn.execute('SELECT * FROM paper_account WHERE id=1').fetchone()
+
+    if reseed:
+        conn.execute('DELETE FROM paper_orders')
+        conn.execute('DELETE FROM paper_positions')
+        conn.execute(
+            'UPDATE paper_account SET cash=starting_cash, realized_pnl=0.0, updated_at=CURRENT_TIMESTAMP WHERE id=1'
+        )
+        account = conn.execute('SELECT * FROM paper_account WHERE id=1').fetchone()
+
+    cash = float(account['cash'] or 0.0)
+    cfg_map = get_base_config_map(conn)
+    applied = []
+
+    for code, cfg in cfg_map.items():
+        if not cfg.get('enabled'):
+            continue
+        target_qty = calc_base_target_qty(cfg.get('base_amount', 0.0), cfg.get('base_cost_line', 0.0), min_lot)
+        if target_qty <= 0:
+            continue
+        base_cost = float(cfg.get('base_cost_line') or 0.0)
+        need_cash = target_qty * base_cost
+        if need_cash > cash + 1e-6:
+            continue
+
+        existing = conn.execute('SELECT total_qty FROM paper_positions WHERE code=?', (code,)).fetchone()
+        if existing and int(existing['total_qty'] or 0) > 0 and not reseed:
+            continue
+
+        cash -= need_cash
+        conn.execute(
+            '''
+            INSERT OR REPLACE INTO paper_positions
+            (code, name, total_qty, available_qty, today_buy_qty, today_sell_qty, avg_cost, realized_pnl, updated_at)
+            VALUES (?,?,?,?,?,?,?,0.0,CURRENT_TIMESTAMP)
+            ''',
+            (code, cfg.get('name', ''), target_qty, target_qty, 0, 0, base_cost)
+        )
+        oid = str(uuid.uuid4())
+        today = datetime.datetime.now().strftime('%Y-%m-%d')
+        now_t = datetime.datetime.now().strftime('%H:%M:%S')
+        conn.execute(
+            '''
+            INSERT OR REPLACE INTO paper_orders
+            (order_id, signal_id, date, time, code, name, side, qty, price, amount, fee, status, reason, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+            ''',
+            (
+                oid, '', today, now_t, code, cfg.get('name', ''), 'BUY', target_qty, base_cost,
+                round(need_cash, 2), 0.0, 'filled', 'base_seed'
+            )
+        )
+        applied.append({'code': code, 'name': cfg.get('name', ''), 'qty': target_qty, 'cost_line': base_cost})
+
+    conn.execute(
+        'UPDATE paper_account SET cash=?, updated_at=CURRENT_TIMESTAMP WHERE id=1',
+        (cash,)
+    )
+    conn.commit()
+    conn.close()
+    if applied:
+        log_debug_event('paper_base_seed_applied', {'count': len(applied), 'items': applied, 'reseed': bool(reseed)})
+    return applied
+
 def plan_paper_order(sig, market_price, account_row, pos_row, nav_approx):
     side = str(sig.get('type', ''))
     code = str(sig.get('code', ''))
@@ -815,25 +972,38 @@ def plan_paper_order(sig, market_price, account_row, pos_row, nav_approx):
     cash = float(account_row['cash'] or 0.0)
     pos_total = int(pos_row['total_qty']) if pos_row else 0
     pos_available = int(pos_row['available_qty']) if pos_row else 0
+    base_cfg = get_base_config_map().get(code, {})
+    base_qty = 0
+    if base_cfg and base_cfg.get('enabled'):
+        base_qty = calc_base_target_qty(base_cfg.get('base_amount', 0.0), base_cfg.get('base_cost_line', 0.0), min_lot)
 
     qty = 0
     reason = ''
     if side == 'BUY':
-        target_budget = max(0.0, nav_approx * base_pct * trend_mul)
-        cur_exposure = pos_total * exec_price
-        max_stock_budget = max(0.0, nav_approx * max_stock_pct - cur_exposure)
-        budget = min(target_budget, max_stock_budget, cash)
-        qty = round_lot_qty(budget / exec_price, min_lot)
+        if pos_total < base_qty:
+            # 底仓不足时优先补齐底仓
+            need_qty = base_qty - pos_total
+            budget = min(cash, need_qty * exec_price)
+            qty = round_lot_qty(budget / exec_price, min_lot)
+            if qty > 0:
+                reason = 'base_replenish'
+        if qty <= 0:
+            target_budget = max(0.0, nav_approx * base_pct * trend_mul)
+            cur_exposure = pos_total * exec_price
+            max_stock_budget = max(0.0, nav_approx * max_stock_pct - cur_exposure)
+            budget = min(target_budget, max_stock_budget, cash)
+            qty = round_lot_qty(budget / exec_price, min_lot)
         if qty < min_lot:
             reason = 'insufficient_cash_or_position_limit'
     else:
-        if pos_available < min_lot:
+        sellable_qty = max(0, pos_available - base_qty)
+        if sellable_qty < min_lot:
             reason = 'no_available_qty'
         else:
             base_sell_frac = 0.35 * trend_mul
             base_sell_frac = max(0.1, min(base_sell_frac, 1.0))
             qty = round_lot_qty(pos_total * base_sell_frac, min_lot)
-            qty = min(qty, round_lot_qty(pos_available, min_lot))
+            qty = min(qty, round_lot_qty(sellable_qty, min_lot))
             if qty < min_lot:
                 reason = 'available_qty_too_small'
 
@@ -853,7 +1023,8 @@ def plan_paper_order(sig, market_price, account_row, pos_row, nav_approx):
         'fee': round(fee, 2),
         'status': 'filled' if qty > 0 else 'rejected',
         'reason': reason,
-        'trend': trend_text
+        'trend': trend_text,
+        'base_qty': int(base_qty)
     }
     return {'ok': qty > 0, 'reason': reason, 'order': order}
 
@@ -1044,6 +1215,7 @@ def get_paper_snapshot(current_state=None, recent_limit=30):
         ''',
         (max(1, min(int(recent_limit), 200)),)
     ).fetchall()
+    base_cfg_map = get_base_config_map(conn)
     conn.close()
 
     cash = float(account['cash'] or 0.0)
@@ -1053,14 +1225,25 @@ def get_paper_snapshot(current_state=None, recent_limit=30):
     positions = []
     market_value = 0.0
     unrealized = 0.0
+    with state_lock:
+        lot_size = int(success_rates.get('paper_min_lot', 100))
     for r in pos_rows:
         code = r['code']
+        base_cfg = base_cfg_map.get(code, {})
+        base_enabled = bool(base_cfg.get('enabled')) if base_cfg else False
+        base_amount = float(base_cfg.get('base_amount', 0.0)) if base_cfg else 0.0
+        base_cost_line = float(base_cfg.get('base_cost_line', 0.0)) if base_cfg else 0.0
+        base_target_qty = calc_base_target_qty(base_amount, base_cost_line, lot_size)
         cur_price = float(current_state.get(code, {}).get('price', r['avg_cost']) or r['avg_cost'] or 0.0)
         total_qty = int(r['total_qty'] or 0)
         mv = cur_price * total_qty
         ur = (cur_price - float(r['avg_cost'] or 0.0)) * total_qty
         market_value += mv
         unrealized += ur
+        realized_pos = float(r['realized_pnl'] or 0.0)
+        effective_cost_line = 0.0
+        if base_enabled and base_target_qty > 0 and base_cost_line > 0:
+            effective_cost_line = max(0.0, base_cost_line - realized_pos / base_target_qty)
         positions.append({
             'code': code,
             'name': r['name'],
@@ -1072,7 +1255,12 @@ def get_paper_snapshot(current_state=None, recent_limit=30):
             'current_price': round(cur_price, 4),
             'market_value': round(mv, 2),
             'unrealized_pnl': round(ur, 2),
-            'realized_pnl': round(float(r['realized_pnl'] or 0.0), 2),
+            'realized_pnl': round(realized_pos, 2),
+            'base_enabled': base_enabled,
+            'base_amount': round(base_amount, 2),
+            'base_cost_line': round(base_cost_line, 4),
+            'base_target_qty': int(base_target_qty),
+            'effective_cost_line': round(effective_cost_line, 4) if effective_cost_line > 0 else 0.0,
             'updated_at': r['updated_at']
         })
 
@@ -1088,7 +1276,8 @@ def get_paper_snapshot(current_state=None, recent_limit=30):
         'total_pnl': round(realized + unrealized, 2),
         'return_pct': round(((nav - starting_cash) / starting_cash * 100.0) if starting_cash > 0 else 0.0, 4),
         'positions': positions,
-        'recent_orders': [dict(r) for r in order_rows]
+        'recent_orders': [dict(r) for r in order_rows],
+        'base_configs': list(base_cfg_map.values())
     }
 
 def reset_paper_account(starting_cash=None):
@@ -2803,6 +2992,52 @@ def api_paper_reset():
     reset_paper_account(starting_cash=starting_cash)
     snapshot = get_paper_snapshot({}, recent_limit=20)
     return jsonify({'success': True, 'paper': snapshot})
+
+@app.route('/api/paper/base-config', methods=['GET'])
+def api_paper_base_config_list():
+    return jsonify({'success': True, 'items': list_base_configs()})
+
+@app.route('/api/paper/base-config', methods=['POST'])
+def api_paper_base_config_upsert():
+    data = request.get_json(silent=True) or {}
+    items = data.get('items')
+    if not isinstance(items, list):
+        items = [data]
+    results = []
+    for item in items:
+        ok, msg = upsert_base_config(
+            item.get('code'),
+            item.get('name', ''),
+            item.get('base_amount', 0.0),
+            item.get('base_cost_line', 0.0),
+            enabled=to_bool(item.get('enabled', True))
+        )
+        results.append({
+            'code': (item.get('code') or '').lower(),
+            'success': ok,
+            'msg': msg
+        })
+
+    apply_seed = to_bool(data.get('apply_seed', False))
+    reseed = to_bool(data.get('reseed', False))
+    applied = []
+    if apply_seed:
+        applied = seed_base_positions(reseed=reseed)
+    snapshot = get_paper_snapshot({}, recent_limit=20)
+    return jsonify({
+        'success': all(r['success'] for r in results),
+        'results': results,
+        'applied': applied,
+        'paper': snapshot
+    })
+
+@app.route('/api/paper/base-config/seed', methods=['POST'])
+def api_paper_base_seed():
+    data = request.get_json(silent=True) or {}
+    reseed = to_bool(data.get('reseed', False))
+    applied = seed_base_positions(reseed=reseed)
+    snapshot = get_paper_snapshot({}, recent_limit=20)
+    return jsonify({'success': True, 'applied': applied, 'paper': snapshot})
 
 @app.route('/api/stocks', methods=['POST'])
 def api_add_stock():

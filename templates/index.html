@@ -185,6 +185,46 @@
                     </div>
                 </div>
 
+                <div class="bg-slate-800/90 rounded-xl border border-slate-700 p-4 shadow-lg">
+                    <div class="flex items-center justify-between mb-3">
+                        <h3 class="text-sm font-semibold text-slate-200">模拟执行账户（80w）</h3>
+                        <span id="paper-return-badge"
+                            class="text-[10px] px-2 py-0.5 rounded border border-slate-600 text-slate-300 bg-slate-700/40">--</span>
+                    </div>
+                    <div class="grid grid-cols-2 lg:grid-cols-5 gap-2 text-[11px] mb-3">
+                        <div class="bg-slate-900/70 rounded p-2 border border-slate-700/50">
+                            <div class="text-slate-500">净值</div>
+                            <div id="paper-nav" class="text-slate-200 font-bold mt-1">--</div>
+                        </div>
+                        <div class="bg-slate-900/70 rounded p-2 border border-slate-700/50">
+                            <div class="text-slate-500">可用现金</div>
+                            <div id="paper-cash" class="text-slate-200 font-bold mt-1">--</div>
+                        </div>
+                        <div class="bg-slate-900/70 rounded p-2 border border-slate-700/50">
+                            <div class="text-slate-500">持仓市值</div>
+                            <div id="paper-mv" class="text-slate-200 font-bold mt-1">--</div>
+                        </div>
+                        <div class="bg-slate-900/70 rounded p-2 border border-slate-700/50">
+                            <div class="text-slate-500">已实现</div>
+                            <div id="paper-realized" class="text-slate-200 font-bold mt-1">--</div>
+                        </div>
+                        <div class="bg-slate-900/70 rounded p-2 border border-slate-700/50">
+                            <div class="text-slate-500">未实现</div>
+                            <div id="paper-unrealized" class="text-slate-200 font-bold mt-1">--</div>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-1 xl:grid-cols-2 gap-3">
+                        <div>
+                            <div class="text-[11px] text-slate-400 mb-1">当前持仓</div>
+                            <div id="paper-positions" class="space-y-1 text-[11px] text-slate-300"></div>
+                        </div>
+                        <div>
+                            <div class="text-[11px] text-slate-400 mb-1">最近成交/拒单</div>
+                            <div id="paper-orders" class="space-y-1 text-[11px] text-slate-300"></div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Dynamic Charts Wrapper -->
                 <div id="charts-wrapper"
                     class="flex flex-col gap-6 flex-grow transition-all duration-300 min-h-[400px]">
@@ -1005,6 +1045,84 @@
             }
         }
 
+        function moneyFmt(v) {
+            return Number(v || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+
+        function renderPaperPanel(paper) {
+            const navEl = document.getElementById('paper-nav');
+            const cashEl = document.getElementById('paper-cash');
+            const mvEl = document.getElementById('paper-mv');
+            const realizedEl = document.getElementById('paper-realized');
+            const unrealizedEl = document.getElementById('paper-unrealized');
+            const retBadgeEl = document.getElementById('paper-return-badge');
+            const posEl = document.getElementById('paper-positions');
+            const orderEl = document.getElementById('paper-orders');
+            if (!navEl || !cashEl || !mvEl || !realizedEl || !unrealizedEl || !retBadgeEl || !posEl || !orderEl) return;
+
+            if (!paper) {
+                navEl.innerText = '--';
+                cashEl.innerText = '--';
+                mvEl.innerText = '--';
+                realizedEl.innerText = '--';
+                unrealizedEl.innerText = '--';
+                retBadgeEl.innerText = '--';
+                posEl.innerHTML = '<div class="text-slate-500">账户未初始化</div>';
+                orderEl.innerHTML = '<div class="text-slate-500">暂无订单</div>';
+                return;
+            }
+
+            navEl.innerText = `¥${moneyFmt(paper.nav)}`;
+            cashEl.innerText = `¥${moneyFmt(paper.cash)}`;
+            mvEl.innerText = `¥${moneyFmt(paper.market_value)}`;
+            realizedEl.innerText = `¥${moneyFmt(paper.realized_pnl)}`;
+            unrealizedEl.innerText = `¥${moneyFmt(paper.unrealized_pnl)}`;
+            const ret = Number(paper.return_pct || 0);
+            const retCls = ret >= 0 ? 'text-emerald-300 border-emerald-500/40 bg-emerald-500/10' : 'text-rose-300 border-rose-500/40 bg-rose-500/10';
+            retBadgeEl.className = `text-[10px] px-2 py-0.5 rounded border ${retCls}`;
+            retBadgeEl.innerText = `总收益 ${ret >= 0 ? '+' : ''}${ret.toFixed(2)}%`;
+
+            const positions = paper.positions || [];
+            if (!positions.length) {
+                posEl.innerHTML = '<div class="text-slate-500">当前空仓</div>';
+            } else {
+                posEl.innerHTML = positions.slice(0, 8).map(p => {
+                    const ur = Number(p.unrealized_pnl || 0);
+                    const urCls = ur >= 0 ? 'text-emerald-300' : 'text-rose-300';
+                    return `
+                        <div class="bg-slate-900/60 border border-slate-700/50 rounded px-2 py-1.5">
+                            <div class="flex justify-between">
+                                <span class="text-slate-200">${escapeHtml(p.name || p.code)} <span class="text-[10px] text-slate-500">${escapeHtml(p.code || '')}</span></span>
+                                <span class="${urCls}">${ur >= 0 ? '+' : ''}${moneyFmt(ur)}</span>
+                            </div>
+                            <div class="text-[10px] text-slate-400 mt-0.5">
+                                持仓 ${p.total_qty} / 可卖 ${p.available_qty} · 成本 ${Number(p.avg_cost || 0).toFixed(2)} · 现价 ${Number(p.current_price || 0).toFixed(2)}
+                            </div>
+                        </div>`;
+                }).join('');
+            }
+
+            const orders = paper.recent_orders || [];
+            if (!orders.length) {
+                orderEl.innerHTML = '<div class="text-slate-500">暂无订单</div>';
+            } else {
+                orderEl.innerHTML = orders.slice(0, 8).map(o => {
+                    const ok = o.status === 'filled';
+                    const cls = ok ? 'text-slate-300 border-slate-700/50' : 'text-amber-200 border-amber-500/30';
+                    return `
+                        <div class="bg-slate-900/60 border ${cls} rounded px-2 py-1.5">
+                            <div class="flex justify-between">
+                                <span>${escapeHtml(o.name || o.code)} ${escapeHtml(o.side || '')} ${o.qty || 0}</span>
+                                <span class="text-[10px] ${ok ? 'text-emerald-300' : 'text-amber-300'}">${escapeHtml(o.status || '')}</span>
+                            </div>
+                            <div class="text-[10px] text-slate-400 mt-0.5">
+                                价 ${Number(o.price || 0).toFixed(2)} · 额 ¥${moneyFmt(o.amount)} · 费 ¥${moneyFmt(o.fee)} ${o.reason ? ('· ' + escapeHtml(o.reason)) : ''}
+                            </div>
+                        </div>`;
+                }).join('');
+            }
+        }
+
         async function fetchStrategyPanels(force = false) {
             const now = Date.now();
             if (!force && now - strategyPanelLastFetchTs < 30000) return;
@@ -1037,6 +1155,7 @@
                 const data = await response.json();
                 updateUI(data);
                 renderPreCloseAlerts(data.pre_close || {});
+                renderPaperPanel(data.paper || null);
                 fetchStrategyPanels();
 
                 // 交易状态指示器

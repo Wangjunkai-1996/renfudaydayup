@@ -31,6 +31,7 @@ MAX_STOCKS = 3
 MARKET_CLOSE_MINUTE = 15 * 60
 PRE_CLOSE_FLATTEN_MINUTE = 14 * 60 + 57
 PRE_CLOSE_WARN_MINUTE = 14 * 60 + 50
+PAPER_START_CASH = 800000.0
 
 # === SQLite 持久化 ===
 DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
@@ -48,17 +49,21 @@ STRATEGY_BOOL_KEYS = (
     'debug_log_enabled', 'auto_daily_report_enabled',
     'time_slot_enabled', 'risk_guard_enabled',
     'regime_filter_enabled', 'regime_require_trend_alignment',
-    'regime_block_open_close'
+    'regime_block_open_close',
+    'paper_trade_enabled', 'paper_auto_execute'
 )
 STRATEGY_FLOAT_KEYS = (
     'win_threshold', 'loss_threshold',
     'buy_min_score', 'sell_min_score', 'buy_pause_min_wr',
-    'risk_daily_profit_floor', 'regime_target_wr', 'trade_cost_buffer'
+    'risk_daily_profit_floor', 'regime_target_wr', 'trade_cost_buffer',
+    'paper_base_order_pct', 'paper_max_stock_pct', 'paper_slippage_pct',
+    'paper_commission_rate', 'paper_sell_stamp_tax'
 )
 STRATEGY_INT_KEYS = (
     'buy_pause_window', 'buy_pause_min_samples',
     'risk_max_consecutive_fail', 'risk_pause_minutes',
-    'regime_lookback_days', 'regime_min_samples', 'regime_slot_min_samples'
+    'regime_lookback_days', 'regime_min_samples', 'regime_slot_min_samples',
+    'paper_min_lot'
 )
 
 DEFAULT_TIME_SLOT_TEMPLATES = {
@@ -77,7 +82,8 @@ DEFAULT_TIME_SLOT_TEMPLATES = {
 UNIT_INTERVAL_FLOAT_KEYS = {
     'win_threshold', 'loss_threshold',
     'buy_min_score', 'sell_min_score', 'buy_pause_min_wr', 'regime_target_wr',
-    'trade_cost_buffer'
+    'trade_cost_buffer', 'paper_base_order_pct', 'paper_max_stock_pct',
+    'paper_slippage_pct', 'paper_commission_rate', 'paper_sell_stamp_tax'
 }
 
 SIGNED_FLOAT_KEYS = {
@@ -348,6 +354,60 @@ def init_db():
             params_json TEXT NOT NULL
         )
     ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS paper_account (
+            id INTEGER PRIMARY KEY CHECK (id=1),
+            starting_cash REAL NOT NULL DEFAULT 800000.0,
+            cash REAL NOT NULL DEFAULT 800000.0,
+            realized_pnl REAL NOT NULL DEFAULT 0.0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS paper_positions (
+            code TEXT PRIMARY KEY,
+            name TEXT DEFAULT '',
+            total_qty INTEGER NOT NULL DEFAULT 0,
+            available_qty INTEGER NOT NULL DEFAULT 0,
+            today_buy_qty INTEGER NOT NULL DEFAULT 0,
+            today_sell_qty INTEGER NOT NULL DEFAULT 0,
+            avg_cost REAL NOT NULL DEFAULT 0.0,
+            realized_pnl REAL NOT NULL DEFAULT 0.0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS paper_orders (
+            order_id TEXT PRIMARY KEY,
+            signal_id TEXT DEFAULT '',
+            date TEXT DEFAULT '',
+            time TEXT DEFAULT '',
+            code TEXT DEFAULT '',
+            name TEXT DEFAULT '',
+            side TEXT DEFAULT '',
+            qty INTEGER NOT NULL DEFAULT 0,
+            price REAL NOT NULL DEFAULT 0.0,
+            amount REAL NOT NULL DEFAULT 0.0,
+            fee REAL NOT NULL DEFAULT 0.0,
+            status TEXT DEFAULT 'filled',
+            reason TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_paper_orders_created ON paper_orders(created_at DESC)')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS paper_meta (
+            k TEXT PRIMARY KEY,
+            v TEXT NOT NULL
+        )
+    ''')
+    conn.execute(
+        'INSERT OR IGNORE INTO paper_account (id, starting_cash, cash, realized_pnl) VALUES (1, ?, ?, 0.0)',
+        (PAPER_START_CASH, PAPER_START_CASH)
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO paper_meta (k, v) VALUES ('trading_date', '')"
+    )
     conn.commit()
     conn.close()
     print(f"💾 数据库已初始化: {DB_PATH}")
@@ -489,6 +549,15 @@ success_rates = {
     'risk_pause_minutes': 30,
     # 成本缓冲（净收益判断）：毛收益需超过该比例才记为 success
     'trade_cost_buffer': 0.0012,
+    # 模拟交易（80w 起步）执行参数
+    'paper_trade_enabled': True,
+    'paper_auto_execute': True,
+    'paper_base_order_pct': 0.10,
+    'paper_max_stock_pct': 0.35,
+    'paper_slippage_pct': 0.0002,
+    'paper_commission_rate': 0.0003,
+    'paper_sell_stamp_tax': 0.001,
+    'paper_min_lot': 100,
     # 仅在高质量策略窗口开仓，目标胜率保守设为 75%
     'regime_filter_enabled': True,
     'regime_target_wr': 0.75,
@@ -654,6 +723,392 @@ def build_pre_close_alert_snapshot(pending_list, current_state, now=None):
         'need_flatten_count': sum(1 for x in alert_items if x.get('should_flatten')),
         'alert_items': alert_items
     }
+
+def paper_rollover_if_new_day(now=None):
+    """交易日切换时，把持仓可卖数量重置为 total_qty（模拟 T+1 解锁）。"""
+    dt = now or datetime.datetime.now()
+    today = dt.strftime('%Y-%m-%d')
+    conn = get_db()
+    row = conn.execute("SELECT v FROM paper_meta WHERE k='trading_date'").fetchone()
+    last_day = row['v'] if row else ''
+    changed = (last_day != today)
+    if changed:
+        conn.execute(
+            '''
+            UPDATE paper_positions
+            SET available_qty = total_qty,
+                today_buy_qty = 0,
+                today_sell_qty = 0,
+                updated_at = CURRENT_TIMESTAMP
+            '''
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO paper_meta (k, v) VALUES ('trading_date', ?)",
+            (today,)
+        )
+        conn.commit()
+    conn.close()
+    if changed:
+        log_debug_event('paper_rollover', {'date': today})
+
+def calc_paper_order_fee(side, amount, commission_rate, sell_stamp_tax):
+    commission = max(5.0, amount * commission_rate)
+    stamp = amount * sell_stamp_tax if side == 'SELL' else 0.0
+    return commission + stamp
+
+def round_lot_qty(raw_qty, lot_size):
+    lot = max(1, int(lot_size))
+    if raw_qty <= 0:
+        return 0
+    return int(raw_qty // lot) * lot
+
+def get_trend_multiplier(side, trend_text):
+    txt = str(trend_text or '')
+    if side == 'BUY':
+        if '多头' in txt:
+            return 1.2
+        if '空头' in txt:
+            return 0.6
+        return 1.0
+    # SELL 作为做T减仓：空头更积极，多头更保守
+    if '空头' in txt:
+        return 1.3
+    if '多头' in txt:
+        return 0.7
+    return 1.0
+
+def plan_paper_order(sig, market_price, account_row, pos_row, nav_approx):
+    side = str(sig.get('type', ''))
+    code = str(sig.get('code', ''))
+    name = str(sig.get('name', ''))
+    signal_id = str(sig.get('id', ''))
+    sig_date = str(sig.get('date') or datetime.datetime.now().strftime('%Y-%m-%d'))
+    sig_time = str(sig.get('time') or '')
+
+    if side not in ('BUY', 'SELL'):
+        return {'ok': False, 'reason': 'unsupported_side', 'order': None}
+    base_price = float(market_price or sig.get('price') or 0.0)
+    if base_price <= 0:
+        return {'ok': False, 'reason': 'invalid_price', 'order': None}
+
+    with state_lock:
+        enabled = bool(success_rates.get('paper_trade_enabled', True))
+        auto_exec = bool(success_rates.get('paper_auto_execute', True))
+        base_pct = float(success_rates.get('paper_base_order_pct', 0.10))
+        max_stock_pct = float(success_rates.get('paper_max_stock_pct', 0.35))
+        slippage_pct = float(success_rates.get('paper_slippage_pct', 0.0002))
+        min_lot = int(success_rates.get('paper_min_lot', 100))
+        commission_rate = float(success_rates.get('paper_commission_rate', 0.0003))
+        sell_stamp_tax = float(success_rates.get('paper_sell_stamp_tax', 0.001))
+        trend_text = str(stock_contexts.get(code, {}).get('trend', ''))
+
+    if not enabled or not auto_exec:
+        return {'ok': False, 'reason': 'paper_disabled', 'order': None}
+
+    trend_mul = get_trend_multiplier(side, trend_text)
+    if int(sig.get('level') or 0) >= 2:
+        trend_mul *= 1.2
+
+    exec_price = base_price * (1 + slippage_pct) if side == 'BUY' else base_price * (1 - slippage_pct)
+    exec_price = max(0.01, exec_price)
+
+    cash = float(account_row['cash'] or 0.0)
+    pos_total = int(pos_row['total_qty']) if pos_row else 0
+    pos_available = int(pos_row['available_qty']) if pos_row else 0
+
+    qty = 0
+    reason = ''
+    if side == 'BUY':
+        target_budget = max(0.0, nav_approx * base_pct * trend_mul)
+        cur_exposure = pos_total * exec_price
+        max_stock_budget = max(0.0, nav_approx * max_stock_pct - cur_exposure)
+        budget = min(target_budget, max_stock_budget, cash)
+        qty = round_lot_qty(budget / exec_price, min_lot)
+        if qty < min_lot:
+            reason = 'insufficient_cash_or_position_limit'
+    else:
+        if pos_available < min_lot:
+            reason = 'no_available_qty'
+        else:
+            base_sell_frac = 0.35 * trend_mul
+            base_sell_frac = max(0.1, min(base_sell_frac, 1.0))
+            qty = round_lot_qty(pos_total * base_sell_frac, min_lot)
+            qty = min(qty, round_lot_qty(pos_available, min_lot))
+            if qty < min_lot:
+                reason = 'available_qty_too_small'
+
+    amount = qty * exec_price
+    fee = calc_paper_order_fee(side, amount, commission_rate, sell_stamp_tax) if qty > 0 else 0.0
+    order = {
+        'order_id': str(uuid.uuid4()),
+        'signal_id': signal_id,
+        'date': sig_date,
+        'time': sig_time,
+        'code': code,
+        'name': name,
+        'side': side,
+        'qty': int(qty),
+        'price': round(exec_price, 4),
+        'amount': round(amount, 2),
+        'fee': round(fee, 2),
+        'status': 'filled' if qty > 0 else 'rejected',
+        'reason': reason,
+        'trend': trend_text
+    }
+    return {'ok': qty > 0, 'reason': reason, 'order': order}
+
+def execute_paper_order(order):
+    conn = get_db()
+    account = conn.execute('SELECT * FROM paper_account WHERE id=1').fetchone()
+    if not account:
+        conn.execute(
+            'INSERT OR REPLACE INTO paper_account (id, starting_cash, cash, realized_pnl) VALUES (1, ?, ?, 0.0)',
+            (PAPER_START_CASH, PAPER_START_CASH)
+        )
+        conn.commit()
+        account = conn.execute('SELECT * FROM paper_account WHERE id=1').fetchone()
+
+    cash = float(account['cash'] or 0.0)
+    realized_total = float(account['realized_pnl'] or 0.0)
+    code = order['code']
+    pos = conn.execute('SELECT * FROM paper_positions WHERE code=?', (code,)).fetchone()
+    total_qty = int(pos['total_qty']) if pos else 0
+    available_qty = int(pos['available_qty']) if pos else 0
+    today_buy_qty = int(pos['today_buy_qty']) if pos else 0
+    today_sell_qty = int(pos['today_sell_qty']) if pos else 0
+    avg_cost = float(pos['avg_cost']) if pos else 0.0
+    pos_realized = float(pos['realized_pnl']) if pos else 0.0
+
+    side = order['side']
+    qty = int(order['qty'])
+    price = float(order['price'])
+    amount = float(order['amount'])
+    fee = float(order['fee'])
+    status = order['status']
+    reason = order.get('reason', '')
+    realized_delta = 0.0
+
+    if status == 'filled' and qty > 0:
+        if side == 'BUY':
+            total_cost = amount + fee
+            if total_cost > cash + 1e-6:
+                status = 'rejected'
+                reason = 'cash_not_enough_at_execution'
+            else:
+                cash -= total_cost
+                new_total = total_qty + qty
+                avg_cost = ((avg_cost * total_qty) + total_cost) / new_total if new_total > 0 else 0.0
+                total_qty = new_total
+                today_buy_qty += qty
+                # 当日买入不能卖，available_qty 保持不变
+        else:
+            if qty > available_qty:
+                status = 'rejected'
+                reason = 'available_qty_not_enough'
+            else:
+                proceeds = amount - fee
+                cash += proceeds
+                realized_delta = proceeds - (avg_cost * qty)
+                total_qty -= qty
+                available_qty -= qty
+                today_sell_qty += qty
+                pos_realized += realized_delta
+                realized_total += realized_delta
+                if total_qty <= 0:
+                    total_qty = 0
+                    available_qty = 0
+                    avg_cost = 0.0
+
+    conn.execute(
+        '''
+        INSERT OR REPLACE INTO paper_orders
+        (order_id, signal_id, date, time, code, name, side, qty, price, amount, fee, status, reason)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ''',
+        (
+            order['order_id'], order.get('signal_id', ''), order.get('date', ''), order.get('time', ''),
+            code, order.get('name', ''), side, qty, price, amount, fee, status, reason
+        )
+    )
+
+    if total_qty > 0:
+        conn.execute(
+            '''
+            INSERT OR REPLACE INTO paper_positions
+            (code, name, total_qty, available_qty, today_buy_qty, today_sell_qty, avg_cost, realized_pnl, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)
+            ''',
+            (code, order.get('name', ''), total_qty, available_qty, today_buy_qty, today_sell_qty, avg_cost, pos_realized)
+        )
+    else:
+        conn.execute('DELETE FROM paper_positions WHERE code=?', (code,))
+
+    conn.execute(
+        'UPDATE paper_account SET cash=?, realized_pnl=?, updated_at=CURRENT_TIMESTAMP WHERE id=1',
+        (cash, realized_total)
+    )
+    conn.commit()
+    conn.close()
+
+    result = dict(order)
+    result['status'] = status
+    result['reason'] = reason
+    result['realized_delta'] = round(realized_delta, 2)
+    result['cash_after'] = round(cash, 2)
+    return result
+
+def maybe_execute_paper_trade(sig, market_price):
+    """信号落地后执行模拟交易（若开启）。"""
+    paper_rollover_if_new_day()
+    conn = get_db()
+    account = conn.execute('SELECT * FROM paper_account WHERE id=1').fetchone()
+    if not account:
+        conn.execute(
+            'INSERT OR REPLACE INTO paper_account (id, starting_cash, cash, realized_pnl) VALUES (1, ?, ?, 0.0)',
+            (PAPER_START_CASH, PAPER_START_CASH)
+        )
+        conn.commit()
+        account = conn.execute('SELECT * FROM paper_account WHERE id=1').fetchone()
+
+    pos = conn.execute('SELECT * FROM paper_positions WHERE code=?', (sig.get('code', ''),)).fetchone()
+    all_pos = conn.execute('SELECT total_qty, avg_cost FROM paper_positions').fetchall()
+    conn.close()
+    nav_approx = float(account['cash'] or 0.0) + sum(float(r['total_qty'] or 0) * float(r['avg_cost'] or 0.0) for r in all_pos)
+    nav_approx = max(1.0, nav_approx)
+
+    plan = plan_paper_order(sig, market_price, account, pos, nav_approx)
+    order = plan.get('order')
+    if not order:
+        return {'executed': False, 'status': 'skipped', 'reason': plan.get('reason', 'no_order')}
+
+    result = execute_paper_order(order)
+    if result.get('status') == 'filled':
+        log_debug_event(
+            'paper_order_filled',
+            {
+                'signal_id': sig.get('id', ''),
+                'code': sig.get('code', ''),
+                'name': sig.get('name', ''),
+                'side': result.get('side'),
+                'qty': result.get('qty'),
+                'price': result.get('price'),
+                'amount': result.get('amount'),
+                'fee': result.get('fee'),
+                'realized_delta': result.get('realized_delta'),
+                'reason': result.get('reason', '')
+            },
+            target_date=sig.get('date')
+        )
+        return {'executed': True, 'status': 'filled', 'order': result}
+
+    log_debug_event(
+        'paper_order_rejected',
+        {
+            'signal_id': sig.get('id', ''),
+            'code': sig.get('code', ''),
+            'name': sig.get('name', ''),
+            'side': result.get('side'),
+            'qty': result.get('qty'),
+            'reason': result.get('reason', '')
+        },
+        target_date=sig.get('date')
+    )
+    return {'executed': False, 'status': result.get('status', 'rejected'), 'order': result}
+
+def get_paper_snapshot(current_state=None, recent_limit=30):
+    current_state = current_state or {}
+    paper_rollover_if_new_day()
+    conn = get_db()
+    account = conn.execute('SELECT * FROM paper_account WHERE id=1').fetchone()
+    if not account:
+        conn.execute(
+            'INSERT OR REPLACE INTO paper_account (id, starting_cash, cash, realized_pnl) VALUES (1, ?, ?, 0.0)',
+            (PAPER_START_CASH, PAPER_START_CASH)
+        )
+        conn.commit()
+        account = conn.execute('SELECT * FROM paper_account WHERE id=1').fetchone()
+
+    pos_rows = conn.execute(
+        '''
+        SELECT code, name, total_qty, available_qty, today_buy_qty, today_sell_qty, avg_cost, realized_pnl, updated_at
+        FROM paper_positions
+        ORDER BY code ASC
+        '''
+    ).fetchall()
+    order_rows = conn.execute(
+        '''
+        SELECT order_id, signal_id, date, time, code, name, side, qty, price, amount, fee, status, reason, created_at
+        FROM paper_orders
+        ORDER BY created_at DESC
+        LIMIT ?
+        ''',
+        (max(1, min(int(recent_limit), 200)),)
+    ).fetchall()
+    conn.close()
+
+    cash = float(account['cash'] or 0.0)
+    starting_cash = float(account['starting_cash'] or PAPER_START_CASH)
+    realized = float(account['realized_pnl'] or 0.0)
+
+    positions = []
+    market_value = 0.0
+    unrealized = 0.0
+    for r in pos_rows:
+        code = r['code']
+        cur_price = float(current_state.get(code, {}).get('price', r['avg_cost']) or r['avg_cost'] or 0.0)
+        total_qty = int(r['total_qty'] or 0)
+        mv = cur_price * total_qty
+        ur = (cur_price - float(r['avg_cost'] or 0.0)) * total_qty
+        market_value += mv
+        unrealized += ur
+        positions.append({
+            'code': code,
+            'name': r['name'],
+            'total_qty': total_qty,
+            'available_qty': int(r['available_qty'] or 0),
+            'today_buy_qty': int(r['today_buy_qty'] or 0),
+            'today_sell_qty': int(r['today_sell_qty'] or 0),
+            'avg_cost': round(float(r['avg_cost'] or 0.0), 4),
+            'current_price': round(cur_price, 4),
+            'market_value': round(mv, 2),
+            'unrealized_pnl': round(ur, 2),
+            'realized_pnl': round(float(r['realized_pnl'] or 0.0), 2),
+            'updated_at': r['updated_at']
+        })
+
+    nav = cash + market_value
+    return {
+        'enabled': True,
+        'starting_cash': round(starting_cash, 2),
+        'cash': round(cash, 2),
+        'market_value': round(market_value, 2),
+        'nav': round(nav, 2),
+        'realized_pnl': round(realized, 2),
+        'unrealized_pnl': round(unrealized, 2),
+        'total_pnl': round(realized + unrealized, 2),
+        'return_pct': round(((nav - starting_cash) / starting_cash * 100.0) if starting_cash > 0 else 0.0, 4),
+        'positions': positions,
+        'recent_orders': [dict(r) for r in order_rows]
+    }
+
+def reset_paper_account(starting_cash=None):
+    cash0 = float(starting_cash or PAPER_START_CASH)
+    cash0 = max(10000.0, cash0)
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    conn = get_db()
+    conn.execute('DELETE FROM paper_orders')
+    conn.execute('DELETE FROM paper_positions')
+    conn.execute(
+        'INSERT OR REPLACE INTO paper_account (id, starting_cash, cash, realized_pnl, updated_at) VALUES (1, ?, ?, 0.0, CURRENT_TIMESTAMP)',
+        (cash0, cash0)
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO paper_meta (k, v) VALUES ('trading_date', ?)",
+        (today,)
+    )
+    conn.commit()
+    conn.close()
+    log_debug_event('paper_account_reset', {'starting_cash': cash0, 'date': today})
 
 def parse_signal_score(desc):
     m = re.search(r'评分:(\d+)%', desc or '')
@@ -1811,6 +2266,7 @@ def fetch_worker():
     while True:
         with state_lock:
             health_state['last_loop_ts'] = time.time()
+        paper_rollover_if_new_day()
         # 每 30 分钟刷新一次全球市场与个股背景信息
         now_ts = time.time()
         if now_ts - last_context_refresh > 1800:
@@ -2003,6 +2459,9 @@ def fetch_worker():
                                     },
                                     target_date=base_payload['date']
                                 )
+                                paper_result = maybe_execute_paper_trade(new_sig, current_prices.get(code, new_sig.get('price', 0.0)))
+                                with state_lock:
+                                    new_sig['paper'] = paper_result
                 
                 # === 移动止损系统 (Trailing Stop) ===
                 db_updates = []
@@ -2260,6 +2719,7 @@ def get_data():
                 'open_price': extras.get('open_price', 0)
             }
     pre_close_snapshot = build_pre_close_alert_snapshot(pending_snapshot, current_state)
+    paper_snapshot = get_paper_snapshot(current_state, recent_limit=20)
 
     return jsonify({
         'active_stocks': active_stocks_snapshot,
@@ -2272,6 +2732,7 @@ def get_data():
         'extras': extras_snapshot,
         'global': global_snapshot,
         'pre_close': pre_close_snapshot,
+        'paper': paper_snapshot,
         'is_trading': is_trading_time()
     })
 
@@ -2314,6 +2775,34 @@ def api_health():
         'risk_pause_reason': reason,
         'alerts': alerts
     })
+
+@app.route('/api/paper/account')
+def api_paper_account():
+    with state_lock:
+        current_state = {}
+        for code, data_list in market_data.items():
+            if data_list:
+                current_state[code] = {'price': data_list[-1].get('price', 0.0)}
+    try:
+        limit = int(request.args.get('limit', 30))
+    except Exception:
+        limit = 30
+    snapshot = get_paper_snapshot(current_state, recent_limit=limit)
+    return jsonify({'success': True, 'paper': snapshot})
+
+@app.route('/api/paper/reset', methods=['POST'])
+def api_paper_reset():
+    data = request.get_json(silent=True) or {}
+    confirm = to_bool(data.get('confirm', False))
+    if not confirm:
+        return jsonify({'success': False, 'msg': 'missing confirm=true'})
+    try:
+        starting_cash = float(data.get('starting_cash', PAPER_START_CASH))
+    except Exception:
+        starting_cash = PAPER_START_CASH
+    reset_paper_account(starting_cash=starting_cash)
+    snapshot = get_paper_snapshot({}, recent_limit=20)
+    return jsonify({'success': True, 'paper': snapshot})
 
 @app.route('/api/stocks', methods=['POST'])
 def api_add_stock():
@@ -3210,7 +3699,7 @@ def maybe_auto_generate_daily_report():
 
     target_date = None
     # 工作日收盘后生成当日日报；周末兜底生成最近一个交易日
-    if now.weekday() < 5 and (now.hour > 15 or (now.hour == 15 and now.minute >= 35)):
+    if now.weekday() < 5 and (now.hour > 15 or (now.hour == 15 and now.minute >= 5)):
         target_date = now.strftime('%Y-%m-%d')
     elif now.weekday() >= 5:
         d = get_previous_trading_day((now - datetime.timedelta(days=1)).date())

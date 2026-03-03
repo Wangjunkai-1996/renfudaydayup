@@ -1,0 +1,886 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🚀 多股量化日内盯盘系统</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/luxon@3.3.0/build/global/luxon.min.js"></script>
+    <script
+        src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@2.2.1/dist/chartjs-plugin-annotation.min.js"></script>
+    <style>
+        body {
+            background-color: #0f172a;
+            color: #f8fafc;
+            font-family: 'Inter', sans-serif;
+        }
+
+        .signal-buy {
+            background: rgba(16, 185, 129, 0.15);
+            border-left: 4px solid #10b981;
+        }
+
+        .signal-sell {
+            background: rgba(239, 68, 68, 0.15);
+            border-left: 4px solid #ef4444;
+        }
+
+        @keyframes pulse-ring {
+            0% {
+                transform: scale(0.8);
+                box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
+            }
+
+            70% {
+                transform: scale(1);
+                box-shadow: 0 0 0 10px rgba(239, 68, 68, 0);
+            }
+
+            100% {
+                transform: scale(0.8);
+                box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
+            }
+        }
+
+        .pulse {
+            animation: pulse-ring 2s infinite;
+        }
+
+        .chart-container {
+            position: relative;
+            height: 100%;
+            width: 100%;
+            min-height: 200px;
+        }
+    </style>
+</head>
+
+<body class="min-h-screen">
+    <div class="container mx-auto max-w-7xl pt-4 px-4 pb-12">
+        <header class="mb-6 border-b border-slate-700 pb-4 overflow-hidden rounded-xl bg-slate-800/40">
+            <!-- Global Market Pulse -->
+            <div id="global-market-bar"
+                class="bg-slate-900/60 border-b border-slate-800 px-4 py-1.5 flex items-center whitespace-nowrap overflow-x-auto no-scrollbar">
+                <span class="text-[10px] font-bold text-slate-500 uppercase flex-shrink-0 mr-4 tracking-tighter">全球脉搏 🌐
+                    <span id="global-update" class="ml-1 opacity-60">--:--:--</span></span>
+                <div id="global-indices" class="flex gap-4 items-center">
+                    <span class="text-[10px] text-slate-500 italic">数据加载中...</span>
+                </div>
+            </div>
+            <div class="p-4 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+                <div>
+                    <h1
+                        class="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-indigo-500">
+                        高级量化终端 v2.5
+                    </h1>
+                    <p class="text-slate-500 mt-1 text-[11px] font-medium tracking-wide">AI 驱动行情监控 | 决策共振评分 | 移动止损护航</p>
+                </div>
+                <div class="flex items-center gap-3 w-full md:w-auto">
+                    <input id="new-stock-code" type="text" placeholder="代码/拼音/名称"
+                        onkeydown="if(event.key==='Enter') addStock()"
+                        class="bg-slate-900/50 text-white px-3 py-2 rounded-lg border border-slate-700 focus:outline-none focus:border-indigo-500 w-full md:w-64 text-sm transition">
+                    <button onclick="addStock()"
+                        class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-semibold transition whitespace-nowrap shadow-lg">
+                        + 添加自选
+                    </button>
+                </div>
+            </div>
+        </header>
+
+        <div class="grid grid-cols-1 xl:grid-cols-4 gap-6">
+            <!-- Left Region -->
+            <div class="xl:col-span-3 space-y-6 flex flex-col">
+                <!-- Stats Section -->
+                <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                    <div class="bg-slate-800 p-4 rounded-xl border border-slate-700">
+                        <div class="text-slate-400 text-xs uppercase font-bold tracking-wider">信号总计</div>
+                        <div id="stat-total" class="text-3xl font-mono font-semibold mt-2">0</div>
+                    </div>
+                    <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 relative group cursor-pointer"
+                        onclick="toggleSettings()">
+                        <div class="text-emerald-400 text-xs uppercase font-bold tracking-wider hover:text-emerald-300">
+                            获利落袋 <span id="lbl-win">(+1.0%)</span> ⚙️</div>
+                        <div id="stat-success" class="text-3xl font-mono font-semibold mt-2 text-emerald-400">0</div>
+                        <!-- Dropdown config -->
+                        <div id="config-panel"
+                            class="absolute top-[110%] left-0 w-64 bg-slate-900 border border-slate-700 p-4 rounded-xl shadow-2xl z-50 hidden transition-all"
+                            onclick="event.stopPropagation()">
+                            <h4 class="text-slate-300 text-sm font-bold mb-3 border-b border-slate-600 pb-2">网格参数微调</h4>
+                            <label class="block text-xs text-slate-400 mb-1">止盈目标 (%)</label>
+                            <input type="number" step="0.1" id="inp-win" value="1.0"
+                                class="w-full bg-slate-800 border-slate-600 rounded px-2 py-1.5 text-slate-200 mb-3 text-sm">
+
+                            <label class="block text-xs text-slate-400 mb-1">止损退火 (%)</label>
+                            <input type="number" step="0.1" id="inp-loss" value="0.8"
+                                class="w-full bg-slate-800 border-slate-600 rounded px-2 py-1.5 text-slate-200 mb-3 text-sm">
+
+                            <button onclick="saveConfig()"
+                                class="w-full bg-indigo-600 hover:bg-indigo-500 text-white rounded py-1.5 text-sm font-semibold">保存应用</button>
+                        </div>
+                    </div>
+                    <div class="bg-slate-800 p-4 rounded-xl border border-slate-700">
+                        <div class="text-rose-400 text-xs uppercase font-bold tracking-wider">止损滑点 <span
+                                id="lbl-loss">(-0.8%)</span></div>
+                        <div id="stat-fail" class="text-3xl font-mono font-semibold mt-2 text-rose-400">0</div>
+                    </div>
+                    <div
+                        class="bg-slate-800 p-4 rounded-xl border border-indigo-900/50 shadow-[0_0_15px_rgba(99,102,241,0.1)]">
+                        <div class="text-indigo-400 text-xs uppercase font-bold tracking-wider">综合胜率</div>
+                        <div id="stat-rate" class="text-3xl font-mono font-extrabold mt-2 text-indigo-400">--%</div>
+                    </div>
+                </div>
+
+                <!-- Dynamic Charts Wrapper -->
+                <div id="charts-wrapper"
+                    class="flex flex-col gap-6 flex-grow transition-all duration-300 min-h-[400px]">
+                    <!-- Charts dynamically rendered here -->
+                </div>
+            </div>
+
+            <!-- Right Sidebar: Signals Log -->
+            <div class="bg-slate-800 rounded-xl border border-slate-700 flex flex-col h-[830px] shadow-xl">
+                <div
+                    class="p-4 border-b border-slate-700 flex justify-between items-center bg-slate-900/40 rounded-t-xl">
+                    <h2 class="text-md font-semibold text-slate-200">全网信号播报</h2>
+                    <div class="flex items-center gap-2">
+                        <span id="trading-status"
+                            class="text-[10px] bg-emerald-600/20 text-emerald-400 border border-emerald-500/30 py-1 px-2 rounded flex items-center gap-1.5">
+                            <div class="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-pulse"></div> 实盘判定中
+                        </span>
+                    </div>
+                </div>
+                <div id="signals-container" class="flex-1 overflow-y-auto p-4 space-y-3">
+                    <!-- Signals go here -->
+                </div>
+            </div>
+        </div>
+
+        <!-- 历史复盘面板 -->
+        <div class="mt-6 bg-slate-800/80 rounded-xl border border-slate-700 shadow-xl overflow-hidden">
+            <div class="p-4 border-b border-slate-700 flex justify-between items-center cursor-pointer bg-slate-900/40"
+                onclick="toggleHistory()">
+                <h2 class="text-md font-semibold text-slate-200 flex items-center gap-2">
+                    📊 历史复盘 <span class="text-slate-500 text-xs font-normal">(点击展开)</span>
+                </h2>
+                <div class="flex items-center gap-3">
+                    <input type="date" id="history-date"
+                        class="bg-slate-800 text-slate-300 text-xs px-2 py-1 rounded border border-slate-600"
+                        onclick="event.stopPropagation()" onchange="loadHistory()">
+                    <svg id="history-arrow" class="w-4 h-4 text-slate-400 transition-transform" fill="none"
+                        stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7">
+                        </path>
+                    </svg>
+                </div>
+            </div>
+            <div id="history-panel" class="hidden">
+                <!-- 每日胜率趋势 -->
+                <div id="history-daily" class="p-4 grid grid-cols-2 md:grid-cols-5 gap-3 border-b border-slate-700/50">
+                </div>
+                <!-- 信号明细表 -->
+                <div id="history-signals" class="p-4 max-h-[400px] overflow-y-auto"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        Chart.register(window['chartjs-plugin-annotation']);
+        let charts = {};
+        let knownSignalIds = new Set();
+        let targetWin = 0.010;
+        let targetLoss = 0.008;
+
+        // === 信号音效系统 (Web Audio API) ===
+        function playSignalSound(type) {
+            try {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.frequency.value = type === 'BUY' ? 880 : 660;
+                osc.type = 'sine';
+                gain.gain.setValueAtTime(0.3, ctx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.5);
+                osc.start(ctx.currentTime);
+                osc.stop(ctx.currentTime + 0.5);
+            } catch (e) { }
+        }
+
+        // === 浏览器通知 ===
+        function sendNotification(title, body) {
+            if (Notification.permission === 'granted') {
+                new Notification(title, { body, icon: '📊' });
+            } else if (Notification.permission !== 'denied') {
+                Notification.requestPermission();
+            }
+        }
+        if ('Notification' in window) Notification.requestPermission();
+
+        function escapeHtml(value) {
+            return String(value ?? '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function sanitizeUrl(value) {
+            try {
+                const url = new URL(String(value || ''), window.location.origin);
+                if (url.protocol === 'http:' || url.protocol === 'https:') {
+                    return url.href;
+                }
+            } catch (e) { }
+            return '#';
+        }
+
+        function newsBadgeHtml(sentiment) {
+            if (sentiment === 'positive') {
+                return "<span class='text-rose-400 border border-rose-500/40 px-1 rounded-sm text-[10px] ml-1 bg-rose-500/10 font-bold tracking-wider'>利多</span>";
+            }
+            if (sentiment === 'negative') {
+                return "<span class='text-emerald-400 border border-emerald-500/40 px-1 rounded-sm text-[10px] ml-1 bg-emerald-500/10 font-bold tracking-wider'>利空</span>";
+            }
+            return "<span class='text-slate-400 border border-slate-500/40 px-1 rounded-sm text-[10px] ml-1 bg-slate-500/10'>中性</span>";
+        }
+
+        function toggleSettings() {
+            const panel = document.getElementById('config-panel');
+            panel.classList.toggle('hidden');
+        }
+
+        async function saveConfig() {
+            const winVal = parseFloat(document.getElementById('inp-win').value);
+            const lossVal = parseFloat(document.getElementById('inp-loss').value);
+
+            try {
+                const res = await fetch('/api/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ win_threshold: winVal / 100.0, loss_threshold: lossVal / 100.0 })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    document.getElementById('lbl-win').innerText = "(+" + winVal.toFixed(1) + "%)";
+                    document.getElementById('lbl-loss').innerText = "(-" + lossVal.toFixed(1) + "%)";
+                    targetWin = winVal / 100.0;
+                    targetLoss = lossVal / 100.0;
+                    toggleSettings();
+                    fetchData(); // Refresh data to apply new thresholds
+                } else {
+                    alert(data.msg || "保存失败");
+                }
+            } catch (e) {
+                console.error("Error saving config:", e);
+                alert("保存失败");
+            }
+        }
+
+        async function addStock() {
+            const input = document.getElementById('new-stock-code');
+            const code = input.value.trim().toLowerCase();
+            if (!code) return;
+
+            try {
+                const res = await fetch('/api/stocks', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ code })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    input.value = '';
+                    fetchData(); // immediately refresh
+                } else {
+                    alert(data.msg);
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        async function removeStock(code) {
+            if (!confirm('确定要移除该股票吗?')) return;
+            try {
+                const res = await fetch('/api/stocks/' + code, { method: 'DELETE' });
+                const data = await res.json();
+                if (data.success) {
+                    fetchData();
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        function createChart(code, name) {
+            const container = document.getElementById('charts-wrapper');
+            const card = document.createElement('div');
+            const safeName = escapeHtml(name);
+            const safeCode = escapeHtml(code);
+            card.id = 'chart-card-' + code;
+            card.className = "bg-slate-800/80 p-4 rounded-xl border border-slate-700 flex flex-col shadow-lg h-[360px]";
+            card.innerHTML = `
+                <div class="flex justify-between items-center mb-2">
+                    <div class="flex items-end gap-3 flex-wrap">
+                        <h2 class="text-xl font-bold text-slate-100">${safeName}</h2>
+                        <span class="text-sm font-normal text-slate-400 uppercase">${safeCode}</span>
+                        <span id="price-badge-${code}" class="ml-2 px-2.5 py-1 rounded text-sm font-mono font-medium bg-slate-900 border border-slate-600 text-blue-400">----</span>
+                        <div id="stats-badge-${code}" class="ml-auto flex items-center gap-2 text-xs"></div>
+                    </div>
+                    <button onclick="removeStock('${code}')" class="text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 text-sm transition px-3 py-1.5 rounded-lg">移除</button>
+                </div>
+                
+                <div class="mb-2 flex flex-col gap-1 relative">
+                    <div class="text-[11px] flex gap-2 flex-wrap items-center">
+                         <span class="bg-indigo-500/20 text-indigo-300 px-2 py-0.5 rounded border border-indigo-500/30 font-medium">板块: <span id="industry-${code}">获取中...</span></span>
+                         <span class="bg-slate-700/50 text-slate-200 px-2 py-0.5 rounded border border-slate-600 font-medium">日线趋势: <span id="trend-${code}">计算中...</span></span>
+                    </div>
+                    
+                    <div class="relative group mt-1">
+                        <div class="text-[11px] text-slate-400 truncate opacity-80 cursor-pointer hover:bg-slate-700/50 hover:text-slate-200 px-1 py-1 rounded transition-colors flex justify-between items-center" onclick="document.getElementById('news-list-${code}').classList.toggle('hidden')">
+                             <div id="news-summary-${code}" class="truncate">🗞️ 机构公告分析: 加载中...</div>
+                             <svg class="w-3 h-3 ml-1 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+                        </div>
+                        
+                        <!-- Collapsible News List -->
+                        <div id="news-list-${code}" class="hidden absolute top-full left-0 mt-1 w-[400px] max-h-48 overflow-y-auto bg-slate-900 border border-slate-600 rounded-lg shadow-2xl z-[100] p-2 flex flex-col gap-1 custom-scrollbar">
+                             <!-- News Items Rendered Here -->
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- 图表 + 盘口并排 -->
+                <div class="flex gap-3 flex-1 min-h-0">
+                    <div class="chart-container flex-1 min-w-0">
+                        <canvas id="canvas-${code}"></canvas>
+                    </div>
+                    <!-- 五档盘口交易窗口 -->
+                    <div id="orderbook-${code}" class="w-[180px] flex-shrink-0 bg-slate-900/60 rounded-lg border border-slate-700/50 p-2 flex flex-col text-[11px] font-mono overflow-hidden">
+                        <div class="text-center text-[10px] text-slate-500 font-sans font-semibold mb-1 tracking-wider border-b border-slate-700/50 pb-1">五档盘口</div>
+                        <div id="asks-${code}" class="flex flex-col justify-end flex-1"></div>
+                        <div id="ob-price-${code}" class="text-center text-base font-bold py-1 border-y border-slate-700/30 my-0.5">--</div>
+                        <div id="bids-${code}" class="flex flex-col flex-1"></div>
+                        <div id="ob-metrics-${code}" class="border-t border-slate-700/50 pt-1 mt-1 text-[10px] text-slate-500 font-sans grid grid-cols-2 gap-x-2 gap-y-0.5"></div>
+                    </div>
+                </div>
+            `;
+            container.appendChild(card);
+
+            const ctx = document.getElementById('canvas-' + code).getContext('2d');
+            let gradient = ctx.createLinearGradient(0, 0, 0, 300);
+            gradient.addColorStop(0, 'rgba(56, 189, 248, 0.35)');
+            gradient.addColorStop(1, 'rgba(15, 23, 42, 0)');
+
+            charts[code] = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        { label: '现价', data: [], borderColor: '#38bdf8', backgroundColor: gradient, borderWidth: 1.5, fill: true, pointRadius: 0, tension: 0.05, borderJoinStyle: 'round' },
+                        { label: 'VWAP', data: [], borderColor: 'rgba(245, 158, 11, 0.8)', borderWidth: 1.5, borderDash: [4, 4], fill: false, pointRadius: 0, tension: 0.1 }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    interaction: { mode: 'index', intersect: false },
+                    plugins: {
+                        legend: { display: false }, // 隐藏顶部图例，更像分时图
+                        annotation: { annotations: {} },
+                        tooltip: {
+                            backgroundColor: 'rgba(15, 23, 42, 0.9)',
+                            titleColor: '#cbd5e1',
+                            bodyColor: '#f8fafc',
+                            borderColor: '#334155',
+                            borderWidth: 1,
+                            intersect: false,
+                            mode: 'index',
+                        }
+                    },
+                    scales: {
+                        x: {
+                            ticks: { color: '#64748b', maxTicksLimit: 7, maxRotation: 0 },
+                            grid: { color: 'rgba(30, 41, 59, 0.5)' }
+                        },
+                        y: {
+                            position: 'right', // 炒股软件里价格通常在右侧
+                            ticks: { color: '#94a3b8' },
+                            grid: { color: 'rgba(30, 41, 59, 0.5)' }
+                        }
+                    }
+                }
+            });
+        }
+
+        function updateUI(data) {
+            const activeCodes = Object.keys(data.active_stocks || {});
+            const chartsWrapper = document.getElementById('charts-wrapper');
+
+            // Responsive Layout Adaptation
+            if (activeCodes.length === 0) {
+                chartsWrapper.innerHTML = '<div class="flex flex-col items-center justify-center p-20 text-slate-500 border-2 border-dashed border-slate-700/50 rounded-xl bg-slate-800/30"><svg class="w-16 h-16 mb-4 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"></path></svg><span class="text-lg font-medium">暂无监控中的股票</span><span class="text-sm mt-2 opacity-75">请在上方搜索栏输入股票代码并添加 (如: sh600079)</span></div>';
+                chartsWrapper.className = "grid grid-cols-1 flex-grow transition-all duration-300 min-h-[400px]";
+            } else {
+                chartsWrapper.className = "flex flex-col gap-4 flex-grow transition-all duration-300";
+            }
+
+            if (activeCodes.length > 0 && chartsWrapper.innerHTML.includes('暂无监控中的股票')) {
+                chartsWrapper.innerHTML = '';
+            }
+
+            // Remove inactive charts
+            for (const code in charts) {
+                if (!activeCodes.includes(code)) {
+                    charts[code].destroy();
+                    delete charts[code];
+                    const el = document.getElementById('chart-card-' + code);
+                    if (el) el.remove();
+                }
+            }
+
+            // Create or Update active charts
+            activeCodes.forEach(code => {
+                if (!charts[code]) {
+                    createChart(code, data.active_stocks[code]);
+                }
+
+                // Update Data
+                const mData = data.market_data[code];
+                if (mData && mData.length > 0) {
+                    charts[code].data.labels = mData.map(d => d.time);
+                    charts[code].data.datasets[0].data = mData.map(d => d.price);
+                    charts[code].data.datasets[1].data = mData.map(d => d.vwap);
+
+                    // Update price badge with % change
+                    const currentPrice = mData[mData.length - 1].price;
+                    const curInfo = data.current && data.current[code];
+                    const yestClose = curInfo ? curInfo.yest_close : 0;
+                    const priceBadge = document.getElementById('price-badge-' + code);
+                    if (yestClose > 0) {
+                        const pctChange = ((currentPrice - yestClose) / yestClose * 100);
+                        const pctColor = pctChange > 0 ? 'text-rose-400 border-rose-500/40' : (pctChange < 0 ? 'text-emerald-400 border-emerald-500/40' : 'text-blue-400 border-slate-600');
+                        priceBadge.className = `ml-2 px-2.5 py-1 rounded text-sm font-mono font-medium bg-slate-900 border ${pctColor}`;
+                        priceBadge.innerHTML = `¥${currentPrice.toFixed(2)} <span class="text-[11px] ml-1">${pctChange >= 0 ? '+' : ''}${pctChange.toFixed(2)}%</span>`;
+
+                        // ===== 分时图专用 Y轴居中与动态扩缩容 =====
+                        let curPrices = mData.map(d => d.price).filter(p => typeof p === 'number' && !isNaN(p));
+                        if (curPrices.length > 0) {
+                            let minP = Math.min(...curPrices);
+                            let maxP = Math.max(...curPrices);
+                            let maxDev = Math.max(Math.abs(minP - yestClose), Math.abs(maxP - yestClose));
+                            maxDev = Math.max(maxDev, yestClose * 0.012); // 至少留 1.2% 振幅空间，防止一字横盘图表太平
+                            charts[code].options.scales.y.min = yestClose - maxDev;
+                            charts[code].options.scales.y.max = yestClose + maxDev;
+
+                            // 动态设置Y轴文字颜色 (红涨绿跌)
+                            charts[code].options.scales.y.ticks.color = (ctx) => {
+                                if (ctx.tick && ctx.tick.value) {
+                                    if (ctx.tick.value > yestClose + 0.001) return '#ef4444'; // rose
+                                    if (ctx.tick.value < yestClose - 0.001) return '#10b981'; // emerald
+                                }
+                                return '#94a3b8';
+                            };
+                        }
+                    } else {
+                        priceBadge.innerText = '¥' + currentPrice.toFixed(2);
+                    }
+
+                    // === 图表标注系统 ===
+                    const annotations = {};
+                    if (yestClose > 0) {
+                        annotations['yest_close'] = { type: 'line', yMin: yestClose, yMax: yestClose, borderColor: 'rgba(255, 255, 255, 0.15)', borderWidth: 1, borderDash: [2, 2] };
+                    }
+
+                    // 涨跌停价格线
+                    if (yestClose > 0) {
+                        const isSTStock = (data.active_stocks[code] || '').includes('ST');
+                        const limitPct = isSTStock ? 0.05 : 0.10;
+                        annotations['limit_up'] = { type: 'line', yMin: yestClose * (1 + limitPct), yMax: yestClose * (1 + limitPct), borderColor: 'rgba(239, 68, 68, 0.4)', borderWidth: 1, borderDash: [6, 4], label: { display: true, content: '涨停', position: 'start', color: '#ef4444', font: { size: 9 }, backgroundColor: 'transparent' } };
+                        annotations['limit_dn'] = { type: 'line', yMin: yestClose * (1 - limitPct), yMax: yestClose * (1 - limitPct), borderColor: 'rgba(16, 185, 129, 0.4)', borderWidth: 1, borderDash: [6, 4], label: { display: true, content: '跌停', position: 'start', color: '#10b981', font: { size: 9 }, backgroundColor: 'transparent' } };
+                    }
+
+                    // R-Breaker 六线
+                    if (data.r_breaker && data.r_breaker[code]) {
+                        const rb = data.r_breaker[code];
+                        const rbLines = [
+                            { key: 'break_buy', label: '突破买', color: 'rgba(16,185,129,0.6)' },
+                            { key: 'observe_sell', label: '观察卖', color: 'rgba(251,191,36,0.4)' },
+                            { key: 'revert_sell', label: '反转卖', color: 'rgba(239,68,68,0.5)' },
+                            { key: 'revert_buy', label: '反转买', color: 'rgba(16,185,129,0.5)' },
+                            { key: 'observe_buy', label: '观察买', color: 'rgba(251,191,36,0.4)' },
+                            { key: 'break_sell', label: '突破卖', color: 'rgba(239,68,68,0.6)' }
+                        ];
+                        rbLines.forEach(l => {
+                            annotations['rb_' + l.key] = { type: 'line', yMin: rb[l.key], yMax: rb[l.key], borderColor: l.color, borderWidth: 1, borderDash: [3, 3], label: { display: true, content: l.label + ' ¥' + rb[l.key].toFixed(2), position: 'end', color: l.color, font: { size: 8 }, backgroundColor: 'transparent' } };
+                        });
+                    }
+
+                    // 信号标注点
+                    if (data.signals) {
+                        const codeSignals = data.signals.filter(s => s.code === code);
+                        const allLabels = charts[code].data.labels || [];
+                        codeSignals.forEach((sig) => {
+                            // 修复标注全都堆积在右侧的问题: Chart.js 类别轴必须绝对匹配 label 才行
+                            let matchTime = sig.time;
+                            if (allLabels.length > 0 && !allLabels.includes(matchTime)) {
+                                // 寻找最近的过去的点缀附
+                                let closest = allLabels[allLabels.length - 1]; // 默认最后一个
+                                for (let i = 0; i < allLabels.length; i++) {
+                                    if (allLabels[i] >= matchTime) {
+                                        closest = allLabels[Math.max(0, i - 1)];
+                                        break;
+                                    }
+                                }
+                                matchTime = closest;
+                            }
+
+                            annotations['annot_' + sig.id] = {
+                                type: 'point',
+                                xValue: matchTime,
+                                yValue: sig.price,
+                                backgroundColor: sig.type === 'BUY' ? 'rgba(16, 185, 129, 0.9)' : 'rgba(239, 68, 68, 0.9)',
+                                borderColor: '#ffffff',
+                                borderWidth: 2,
+                                radius: 5,
+                                label: { display: true, content: sig.type === 'BUY' ? '买' : '卖', position: 'top', color: 'white', font: { size: 10 } }
+                            };
+                        });
+                    }
+                    charts[code].options.plugins.annotation.annotations = annotations;
+                    charts[code].update();
+
+                    // === 五档盘口实时更新 ===
+                    const ex = data.extras && data.extras[code];
+                    if (ex && ex.bids && ex.asks) {
+                        const maxVol = Math.max(...ex.bids.map(b => b.v), ...ex.asks.map(a => a.v), 1);
+                        const yc = ex.yest_close || 1;
+
+                        const fmtRow = (label, p, v, isBuy) => {
+                            const pct = ((p - yc) / yc * 100);
+                            const pColor = pct > 0 ? 'text-rose-400' : (pct < 0 ? 'text-emerald-400' : 'text-slate-300');
+                            const barW = (v / maxVol * 100).toFixed(0);
+                            const barColor = isBuy ? 'rgba(16,185,129,0.15)' : 'rgba(239,68,68,0.15)';
+                            const volStr = v >= 10000 ? (v / 10000).toFixed(1) + '万' : v;
+                            return `<div class="flex items-center px-1 py-[2px] rounded-sm" style="background:linear-gradient(${isBuy ? 'to right' : 'to left'},${barColor} ${barW}%,transparent ${barW}%)">
+                                <span class="text-slate-600 w-5 text-[10px]">${label}</span>
+                                <span class="${pColor} flex-1">${p.toFixed(2)}</span>
+                                <span class="text-slate-500 text-right">${volStr}</span>
+                            </div>`;
+                        };
+
+                        // 卖盘（从卖五到卖一，倒序）
+                        const asksEl = document.getElementById('asks-' + code);
+                        const sortedAsks = [...ex.asks].reverse();
+                        asksEl.innerHTML = sortedAsks.map((a, i) => fmtRow('卖' + (5 - i), a.p, a.v, false)).join('');
+
+                        // 当前价
+                        const obPriceEl = document.getElementById('ob-price-' + code);
+                        const curP = currentPrice;
+                        const curPct = ((curP - yc) / yc * 100);
+                        const curColor = curPct > 0 ? 'text-rose-400' : (curPct < 0 ? 'text-emerald-400' : 'text-slate-200');
+                        obPriceEl.innerHTML = `<span class="${curColor}">¥${curP.toFixed(2)}</span> <span class="text-[10px] ${curColor}">${curPct >= 0 ? '+' : ''}${curPct.toFixed(2)}%</span>`;
+
+                        // 买盘
+                        const bidsEl = document.getElementById('bids-' + code);
+                        bidsEl.innerHTML = ex.bids.map((b, i) => fmtRow('买' + (i + 1), b.p, b.v, true)).join('');
+
+                        // 关键指标
+                        const metricsEl = document.getElementById('ob-metrics-' + code);
+                        const volW = (ex.volume / 10000).toFixed(0);
+                        const amtY = (ex.amount / 100000000);
+                        metricsEl.innerHTML = `
+                            <span>开 <b class="text-slate-300">${ex.open_price.toFixed(2)}</b></span>
+                            <span>高 <b class="text-rose-400">${ex.high.toFixed(2)}</b></span>
+                            <span>低 <b class="text-emerald-400">${ex.low.toFixed(2)}</b></span>
+                            <span>量 <b class="text-slate-300">${volW}万</b></span>
+                        `;
+                    }
+                }
+
+                // Update Contexts (Industry, Trend, News)
+                if (data.contexts && data.contexts[code]) {
+                    const ctx = data.contexts[code];
+
+                    if (ctx.industry) {
+                        document.getElementById('industry-' + code).innerHTML = ctx.industry;
+                    }
+                    if (ctx.trend) {
+                        const trendEl = document.getElementById('trend-' + code);
+                        trendEl.innerText = ctx.trend;
+                        if (ctx.trend.includes('多头')) trendEl.className = 'text-emerald-400';
+                        else if (ctx.trend.includes('空头')) trendEl.className = 'text-rose-400';
+                        else trendEl.className = 'text-amber-400';
+                    }
+                    if (ctx.news && ctx.news.length > 0) {
+                        // Display summary of first item
+                        const firstNews = ctx.news[0];
+                        const summaryEl = document.getElementById('news-summary-' + code);
+                        if (summaryEl) {
+                            const newsTime = escapeHtml(firstNews.time);
+                            const newsTitle = escapeHtml(firstNews.title);
+                            const badge = newsBadgeHtml(firstNews.sentiment);
+                            summaryEl.innerHTML = `<span class="bg-slate-700/60 px-1.5 py-0.5 rounded text-slate-300 mr-1">最新雷达</span><span class="font-medium text-slate-300">[${newsTime}]</span> ${newsTitle} ${badge} <span class="text-[10px] ml-2 font-medium opacity-60">(点击展开 ${ctx.news.length} 条)</span>`;
+                        }
+
+                        // Populate Dropdown Modal
+                        const listEl = document.getElementById('news-list-' + code);
+                        if (listEl) {
+                            listEl.innerHTML = ctx.news.map(n => `
+                                    <a href="${sanitizeUrl(n.url)}" target="_blank" rel="noopener noreferrer" class="block text-xs hover:bg-slate-800 p-2 rounded transition-colors group/news">
+                                        <div class="flex flex-col gap-1">
+                                            <div class="flex justify-between items-start gap-2">
+                                                <span class="text-slate-300 group-hover/news:text-indigo-300 transition-colors line-clamp-2 leading-snug font-medium text-left">${escapeHtml(n.title)}</span>
+                                                <span class="flex-shrink-0">${newsBadgeHtml(n.sentiment)}</span>
+                                            </div>
+                                            <span class="text-slate-500 text-[10px] block text-left">${escapeHtml(n.time)}</span>
+                                        </div>
+                                    </a>
+                                `).join('<div class="h-px bg-slate-800 my-0.5"></div>');
+                        }
+                    }
+                }
+
+                // Update Per-Stock Stats
+                if (data.stats && data.stats.stocks && data.stats.stocks[code]) {
+                    const st = data.stats.stocks[code];
+                    const tot = st.success + st.fail;
+                    const stBadge = document.getElementById('stats-badge-' + code);
+                    if (stBadge) {
+                        if (tot > 0) {
+                            const wr = (st.success / tot * 100).toFixed(1);
+                            stBadge.innerHTML = `<span class="bg-indigo-500/10 text-indigo-300 px-2 py-0.5 rounded border border-indigo-500/20">单票胜率 ${wr}%</span><span class="bg-slate-800 text-slate-400 px-2 py-0.5 rounded border border-slate-700">✅ ${st.success} ❌ ${st.fail}</span>`;
+                        } else {
+                            stBadge.innerHTML = '<span class="text-slate-500 italic px-2">暂无平仓记录</span>';
+                        }
+                    }
+                }
+            });
+
+            // Update stats
+            if (data.stats) {
+                document.getElementById('stat-total').innerText = data.stats.total;
+                document.getElementById('stat-success').innerText = data.stats.success;
+                document.getElementById('stat-fail').innerText = data.stats.fail;
+
+                let completed = data.stats.success + data.stats.fail;
+                if (completed > 0) {
+                    let rate = (data.stats.success / completed * 100).toFixed(1);
+                    document.getElementById('stat-rate').innerText = rate + '%';
+                }
+            }
+
+            // Update Global Market Ticker
+            if (data.global && data.global.indices) {
+                const globalBar = document.getElementById('global-indices');
+                const updateEl = document.getElementById('global-update');
+                updateEl.innerText = data.global.update_time;
+
+                globalBar.innerHTML = data.global.indices.map(idx => `
+                    <div class="flex items-center gap-1.5 border-r border-slate-800 pr-4">
+                        <span class="text-[11px] font-medium text-slate-400">${escapeHtml(idx.name)}</span>
+                        <span class="text-[11px] font-mono font-bold ${idx.is_up ? 'text-rose-400' : 'text-emerald-400'}">${escapeHtml(idx.price)}</span>
+                        <span class="text-[10px] font-mono ${idx.is_up ? 'text-rose-400' : 'text-emerald-400'}">${escapeHtml(idx.pct)}</span>
+                    </div>
+                `).join('');
+            }
+
+            // Update Signals Log
+            if (data.signals) {
+                const container = document.getElementById('signals-container');
+                const scrollPos = container.scrollTop;
+                const isBottom = scrollPos + container.clientHeight >= container.scrollHeight - 20;
+
+                container.innerHTML = '';
+                data.signals.forEach(sig => {
+                    const el = document.createElement('div');
+                    el.className = `p-4 rounded-xl border ${sig.type === 'BUY' ? 'border-emerald-500/20 signal-buy' : 'border-rose-500/20 signal-sell'} transition-transform hover:scale-[1.01] shadow-sm`;
+                    const safeName = escapeHtml(sig.name);
+                    const safeTime = escapeHtml(sig.time);
+                    const safeDesc = escapeHtml(sig.desc);
+                    const safeResolveMsg = escapeHtml(sig.resolve_msg || '');
+
+                    let statusColor = "text-slate-400";
+                    let statusText = `移动止损中 (盈+${(targetWin * 100).toFixed(1)}% / 损-${(targetLoss * 100).toFixed(1)}%)...`;
+                    if (sig.status === 'success') { statusColor = "text-emerald-400"; statusText = "🎯 狙击成功 (收割利润)"; }
+                    else if (sig.status === 'fail') { statusColor = "text-rose-400"; statusText = "🛡️ 止损触发 (保住本金)"; }
+
+                    let isNew = !knownSignalIds.has(sig.id);
+                    if (isNew) {
+                        knownSignalIds.add(sig.id);
+                        // 新信号音效 + 浏览器通知
+                        playSignalSound(sig.type);
+                        sendNotification(
+                            sig.type === 'BUY' ? '💰 买入信号' : '🔥 卖出信号',
+                            `${sig.name || ''} ¥${Number(sig.price || 0).toFixed(2)} ${(sig.desc || '').substring(0, 50)}`
+                        );
+                    }
+
+                    let badge = isNew ? `<span class="ml-auto inline-block px-1.5 py-0.5 rounded text-[10px] font-medium bg-red-500/20 text-red-300 animate-pulse border border-red-500/30">NEW</span>` : '';
+
+                    el.innerHTML = `
+                        <div class="flex items-center gap-2 mb-2">
+                            <span class="px-2 py-0.5 rounded text-xs font-bold ${sig.type === 'BUY' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-rose-500/10 text-rose-400'} border ${sig.type === 'BUY' ? 'border-emerald-500/20' : 'border-rose-500/20'}">
+                                ${sig.type === 'BUY' ? '买入' : '卖出'}
+                            </span>
+                            <span class="text-sm font-semibold text-slate-100">${safeName}</span>
+                            <span class="text-xs text-slate-400 font-mono">${safeTime}</span>
+                            ${badge}
+                        </div>
+                        <div class="text-slate-300 text-[13px] leading-relaxed mb-3">
+                            ${safeDesc}
+                        </div>
+                        <div class="flex flex-col">
+                            <div class="flex justify-between items-center bg-slate-900/60 rounded-t p-2">
+                                <div class="font-mono text-lg font-bold ${sig.type === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}">
+                                    均价 ¥${sig.price.toFixed(2)}
+                                </div>
+                                <div class="text-[11px] ${statusColor} font-sans flex items-center gap-1.5">
+                                     <div class="w-1.5 h-1.5 rounded-full ${sig.status === 'success' ? 'bg-emerald-400' : (sig.status === 'fail' ? 'bg-rose-400' : 'bg-slate-400 animate-pulse')}"></div>
+                                     ${statusText}
+                                </div>
+                            </div>
+                            <div class="flex justify-between items-center text-[11px] bg-slate-800/80 px-2 py-1.5 rounded-b border-t border-slate-700/50 hidden lg:flex">
+                                ${sig.status === 'pending' ? `
+                                <span class="text-slate-400">
+                                    🎯 止盈目标: <span class="text-emerald-400 font-mono font-bold">¥${sig.win_price ? sig.win_price.toFixed(2) : (sig.type === 'BUY' ? (sig.price * (1 + targetWin)).toFixed(2) : (sig.price * (1 - targetWin)).toFixed(2))}</span>
+                                </span>
+                                <span class="text-slate-400">
+                                    🛡️ 跟踪止损位: <span class="text-rose-400 font-mono font-bold">¥${sig.stop_price ? sig.stop_price.toFixed(2) : (sig.type === 'BUY' ? (sig.price * (1 - targetLoss)).toFixed(2) : (sig.price * (1 + targetLoss)).toFixed(2))}</span>
+                                </span>` : `
+                                <span class="text-slate-400">平仓价: <span class="font-mono font-bold ${sig.status === 'success' ? 'text-emerald-400' : 'text-rose-400'}">¥${sig.resolved_price ? sig.resolved_price.toFixed(2) : '--'}</span></span>
+                                <span class="text-slate-300 font-medium">${safeResolveMsg}</span>
+                                `}
+                            </div>
+                        </div>
+                    `;
+                    container.appendChild(el);
+                });
+
+                if (data.signals.length === 0) {
+                    container.innerHTML = `
+                        <div class="h-full flex flex-col items-center justify-center text-slate-500 p-6 text-center space-y-3">
+                            <svg class="w-10 h-10 opacity-40" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+                            <span class="text-sm font-medium">暂时没有信号产生</span>
+                            <span class="text-xs opacity-70">全天候监控中...符合极端背离时将自动播报</span>
+                        </div>`;
+                }
+
+                if (isBottom) container.scrollTop = container.scrollHeight;
+            }
+        }
+
+        async function fetchData() {
+            try {
+                const response = await fetch('/api/data');
+                const data = await response.json();
+                updateUI(data);
+
+                // 交易状态指示器
+                const statusEl = document.getElementById('trading-status');
+                if (statusEl) {
+                    if (data.is_trading) {
+                        statusEl.className = 'text-[10px] bg-emerald-600/20 text-emerald-400 border border-emerald-500/30 py-1 px-2 rounded flex items-center gap-1.5';
+                        statusEl.innerHTML = '<div class="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-pulse"></div> 盘中监控';
+                    } else {
+                        statusEl.className = 'text-[10px] bg-slate-600/20 text-slate-400 border border-slate-500/30 py-1 px-2 rounded flex items-center gap-1.5';
+                        statusEl.innerHTML = '<div class="w-1.5 h-1.5 bg-slate-500 rounded-full"></div> 休市待命';
+                    }
+                }
+            } catch (error) {
+                console.error('Error fetching data:', error);
+            }
+        }
+
+        // === 历史复盘 ===
+        function toggleHistory() {
+            const panel = document.getElementById('history-panel');
+            const arrow = document.getElementById('history-arrow');
+            panel.classList.toggle('hidden');
+            arrow.style.transform = panel.classList.contains('hidden') ? '' : 'rotate(180deg)';
+            if (!panel.classList.contains('hidden') && !panel.dataset.loaded) {
+                loadHistory();
+                panel.dataset.loaded = '1';
+            }
+        }
+
+        async function loadHistory() {
+            const dateInput = document.getElementById('history-date');
+            const dateVal = dateInput.value;
+            const url = dateVal ? `/api/history?date=${dateVal}` : '/api/history?days=14';
+
+            try {
+                const res = await fetch(url);
+                const data = await res.json();
+
+                // 每日统计卡片
+                const dailyEl = document.getElementById('history-daily');
+                if (data.daily_stats && data.daily_stats.length > 0) {
+                    dailyEl.innerHTML = data.daily_stats.map(d => {
+                        const rateColor = d.win_rate >= 60 ? 'text-emerald-400' : (d.win_rate >= 40 ? 'text-amber-400' : 'text-rose-400');
+                        return `<div class="bg-slate-900/60 rounded-lg p-3 border border-slate-700/50">
+                            <div class="text-slate-500 text-[10px] mb-1">${escapeHtml(d.date)}</div>
+                            <div class="text-lg font-bold ${rateColor}">${d.win_rate}%</div>
+                            <div class="text-[10px] text-slate-500 mt-1">
+                                总${d.total} ✅${d.success} ❌${d.fail}
+                            </div>
+                        </div>`;
+                    }).join('');
+                } else {
+                    dailyEl.innerHTML = '<div class="col-span-5 text-center text-slate-500 text-sm py-4">暂无历史数据</div>';
+                }
+
+                // 信号明细表
+                const sigEl = document.getElementById('history-signals');
+                if (data.signals && data.signals.length > 0) {
+                    sigEl.innerHTML = `
+                        <table class="w-full text-xs">
+                            <thead>
+                                <tr class="text-slate-500 border-b border-slate-700">
+                                    <th class="text-left py-2 px-2">日期</th>
+                                    <th class="text-left py-2 px-2">时间</th>
+                                    <th class="text-left py-2 px-2">股票</th>
+                                    <th class="text-center py-2 px-2">方向</th>
+                                    <th class="text-right py-2 px-2">价格</th>
+                                    <th class="text-center py-2 px-2">状态</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${data.signals.map(s => {
+                        const typeClass = s.type === 'BUY' ? 'text-emerald-400 bg-emerald-500/10' : 'text-rose-400 bg-rose-500/10';
+                        let statusBadge = '<span class="text-slate-400">⏳待定</span>';
+                        if (s.status === 'success') statusBadge = '<span class="text-emerald-400">✅成功</span>';
+                        else if (s.status === 'fail') statusBadge = '<span class="text-rose-400">❌止损</span>';
+
+                        let resolveDesc = '';
+                        if (s.status !== 'pending' && s.resolve_msg) {
+                            resolveDesc = `<br><span class="text-[10px] text-slate-400">${escapeHtml(s.resolve_msg)} (¥${s.resolved_price ? s.resolved_price.toFixed(2) : '--'})</span>`;
+                        }
+
+                        return `<tr class="border-b border-slate-800 hover:bg-slate-800/50 transition-colors">
+                                        <td class="py-2 px-2 text-slate-400">${escapeHtml(s.date)}</td>
+                                        <td class="py-2 px-2 text-slate-300 font-mono">${escapeHtml(s.time)}</td>
+                                        <td class="py-2 px-2 text-slate-200 font-medium">${escapeHtml(s.name)}</td>
+                                        <td class="py-2 px-2 text-center"><span class="px-1.5 py-0.5 rounded text-[10px] font-bold ${typeClass}">${s.type === 'BUY' ? '买' : '卖'}</span></td>
+                                        <td class="py-2 px-2 text-right font-mono text-slate-200">¥${s.price.toFixed(2)}${resolveDesc}</td>
+                                        <td class="py-2 px-2 text-center">${statusBadge}</td>
+                                    </tr>`;
+                    }).join('')}
+                            </tbody>
+                        </table>`;
+                } else {
+                    sigEl.innerHTML = '<div class="text-center text-slate-500 text-sm py-6">当日无信号记录</div>';
+                }
+            } catch (e) {
+                console.error('load history error:', e);
+            }
+        }
+
+        window.onload = () => {
+            fetchData();
+            setInterval(fetchData, 3000);
+        };
+    </script>
+</body>
+
+</html>

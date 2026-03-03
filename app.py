@@ -31,6 +31,7 @@ except ImportError:
 
 from renfu.api_auth import verify_request_token
 from renfu.market_provider import MarketQuoteManager
+from renfu.routes_management import register_management_routes
 from renfu.routes_reports import register_report_routes
 from renfu.routes_runtime import register_runtime_routes
 from renfu.trade_calendar import TradeCalendar
@@ -3300,204 +3301,6 @@ if sock is not None:
             except Exception:
                 break
 
-@app.route('/api/paper/account')
-def api_paper_account():
-    with state_lock:
-        current_state = {}
-        for code, data_list in market_data.items():
-            if data_list:
-                current_state[code] = {'price': data_list[-1].get('price', 0.0)}
-    try:
-        limit = int(request.args.get('limit', 30))
-    except Exception:
-        limit = 30
-    snapshot = get_paper_snapshot(current_state, recent_limit=limit)
-    return jsonify({'success': True, 'paper': snapshot})
-
-@app.route('/api/paper/reset', methods=['POST'])
-def api_paper_reset():
-    data = request.get_json(silent=True) or {}
-    confirm = to_bool(data.get('confirm', False))
-    if not confirm:
-        return jsonify({'success': False, 'msg': 'missing confirm=true'})
-    try:
-        starting_cash = float(data.get('starting_cash', PAPER_START_CASH))
-    except Exception:
-        starting_cash = PAPER_START_CASH
-    reset_paper_account(starting_cash=starting_cash)
-    snapshot = get_paper_snapshot({}, recent_limit=20)
-    return jsonify({'success': True, 'paper': snapshot})
-
-@app.route('/api/paper/base-config', methods=['GET'])
-def api_paper_base_config_list():
-    return jsonify({'success': True, 'items': list_base_configs()})
-
-@app.route('/api/paper/base-config', methods=['POST'])
-def api_paper_base_config_upsert():
-    data = request.get_json(silent=True) or {}
-    items = data.get('items')
-    if not isinstance(items, list):
-        items = [data]
-    results = []
-    for item in items:
-        ok, msg = upsert_base_config(
-            item.get('code'),
-            item.get('name', ''),
-            item.get('base_amount', 0.0),
-            item.get('base_cost_line', 0.0),
-            enabled=to_bool(item.get('enabled', True)),
-            t_order_amount=item.get('t_order_amount', 0.0),
-            t_daily_budget=item.get('t_daily_budget', 0.0),
-            t_costline_strength=item.get('t_costline_strength', 1.0)
-        )
-        results.append({
-            'code': (item.get('code') or '').lower(),
-            'success': ok,
-            'msg': msg
-        })
-
-    apply_seed = to_bool(data.get('apply_seed', False))
-    reseed = to_bool(data.get('reseed', False))
-    applied = []
-    if apply_seed:
-        applied = seed_base_positions(reseed=reseed)
-    snapshot = get_paper_snapshot({}, recent_limit=20)
-    return jsonify({
-        'success': all(r['success'] for r in results),
-        'results': results,
-        'applied': applied,
-        'paper': snapshot
-    })
-
-@app.route('/api/paper/base-config/seed', methods=['POST'])
-def api_paper_base_seed():
-    data = request.get_json(silent=True) or {}
-    reseed = to_bool(data.get('reseed', False))
-    applied = seed_base_positions(reseed=reseed)
-    snapshot = get_paper_snapshot({}, recent_limit=20)
-    return jsonify({'success': True, 'applied': applied, 'paper': snapshot})
-
-@app.route('/api/stocks', methods=['POST'])
-def api_add_stock():
-    payload = request.get_json(silent=True) or {}
-    code = payload.get('code', '').strip().lower()
-    success, msg = apply_add_stock(code)
-    return jsonify({'success': success, 'msg': msg})
-
-@app.route('/api/config', methods=['POST'])
-def update_config():
-    data = request.get_json(silent=True) or {}
-    try:
-        ok, errors, applied = apply_strategy_patch(data)
-        if not ok:
-            log_debug_event('config_update_failed', {'changes': data, 'errors': errors})
-            return jsonify({'success': False, 'msg': 'invalid config', 'errors': errors})
-
-        log_debug_event(
-            'config_updated',
-            {
-                'changes': applied,
-                'strategy': get_strategy_snapshot()
-            }
-        )
-
-        return jsonify({'success': True, 'applied': applied})
-    except Exception as e:
-        log_debug_event('config_update_failed', {'changes': data, 'error': str(e)})
-        return jsonify({'success': False, 'msg': str(e)})
-
-@app.route('/api/config/snapshots', methods=['GET'])
-def api_list_config_snapshots():
-    try:
-        limit = int(request.args.get('limit', 30))
-    except Exception:
-        limit = 30
-    items = list_param_versions(limit=limit)
-    return jsonify({'success': True, 'items': items})
-
-@app.route('/api/config/snapshots', methods=['POST'])
-def api_save_config_snapshot():
-    data = request.get_json(silent=True) or {}
-    note = data.get('note', '')
-    version_id, snapshot = save_param_version(note=note)
-    log_debug_event(
-        'config_snapshot_saved',
-        {'version_id': version_id, 'note': note, 'strategy': snapshot}
-    )
-    return jsonify({'success': True, 'id': version_id, 'note': note, 'params': snapshot})
-
-@app.route('/api/config/rollback', methods=['POST'])
-def api_config_rollback():
-    data = request.get_json(silent=True) or {}
-    version_id = data.get('id')
-    if version_id is None:
-        return jsonify({'success': False, 'msg': 'missing id'})
-    try:
-        version_id = int(version_id)
-    except Exception:
-        return jsonify({'success': False, 'msg': 'invalid id'})
-
-    version = get_param_version(version_id)
-    if not version:
-        return jsonify({'success': False, 'msg': f'param version not found: {version_id}'})
-
-    ok, errors, applied = apply_strategy_patch(version.get('params', {}))
-    if not ok:
-        log_debug_event(
-            'config_rollback_failed',
-            {'version_id': version_id, 'errors': errors, 'raw_params': version.get('params', {})}
-        )
-        return jsonify({'success': False, 'msg': 'rollback apply failed', 'errors': errors})
-
-    log_debug_event(
-        'config_rollback_applied',
-        {
-            'version_id': version_id,
-            'note': version.get('note', ''),
-            'changes': applied,
-            'strategy': get_strategy_snapshot()
-        }
-    )
-    return jsonify({
-        'success': True,
-        'version_id': version_id,
-        'note': version.get('note', ''),
-        'applied': applied
-    })
-
-@app.route('/api/stocks/<code>', methods=['DELETE'])
-def api_remove_stock(code):
-    apply_remove_stock(code.lower())
-    return jsonify({'success': True})
-
-@app.route('/api/history')
-def api_history():
-    """查询历史信号：?date=2026-02-27 或 ?days=7"""
-    try:
-        conn = get_db()
-        date_q = request.args.get('date')
-        days_q = int(request.args.get('days', 7))
-        
-        if date_q:
-            signals = conn.execute('SELECT * FROM signals WHERE date=? ORDER BY created_at DESC', (date_q,)).fetchall()
-            stats = conn.execute('SELECT * FROM daily_stats WHERE date=?', (date_q,)).fetchone()
-        else:
-            since = (datetime.datetime.now() - datetime.timedelta(days=days_q)).strftime('%Y-%m-%d')
-            signals = conn.execute('SELECT * FROM signals WHERE date>=? ORDER BY date DESC, created_at DESC', (since,)).fetchall()
-            stats = None
-        
-        # 获取每日汇总
-        daily = conn.execute('SELECT * FROM daily_stats ORDER BY date DESC LIMIT ?', (days_q,)).fetchall()
-        conn.close()
-        
-        return jsonify({
-            'signals': [dict(r) for r in signals],
-            'daily_stats': [dict(r) for r in daily],
-            'date_stats': dict(stats) if stats else None
-        })
-    except Exception as e:
-        return jsonify({'error': str(e)})
-
 def read_debug_log_entries(target_date, limit=500):
     path = get_debug_log_path(target_date)
     if not os.path.exists(path):
@@ -4469,6 +4272,28 @@ register_runtime_routes(
     is_risk_paused=is_risk_paused,
     is_trading_time=is_trading_time,
     build_periodic_report=build_periodic_report
+)
+
+register_management_routes(
+    app,
+    state_lock=state_lock,
+    market_data=market_data,
+    to_bool=to_bool,
+    paper_start_cash=PAPER_START_CASH,
+    get_paper_snapshot=get_paper_snapshot,
+    reset_paper_account=reset_paper_account,
+    list_base_configs=list_base_configs,
+    upsert_base_config=upsert_base_config,
+    seed_base_positions=seed_base_positions,
+    apply_add_stock=apply_add_stock,
+    apply_strategy_patch=apply_strategy_patch,
+    log_debug_event=log_debug_event,
+    get_strategy_snapshot=get_strategy_snapshot,
+    list_param_versions=list_param_versions,
+    save_param_version=save_param_version,
+    get_param_version=get_param_version,
+    apply_remove_stock=apply_remove_stock,
+    get_db=get_db
 )
 
 register_report_routes(

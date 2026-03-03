@@ -4,6 +4,8 @@ import os
 
 from flask import Blueprint, jsonify, request
 
+from renfu.request_args import parse_int_value
+
 
 def register_report_routes(
     app,
@@ -40,11 +42,7 @@ def register_report_routes(
     @bp.route('/api/debug/logs')
     def api_debug_logs_route():
         date_q = request.args.get('date') or datetime.datetime.now().strftime('%Y-%m-%d')
-        try:
-            limit = int(request.args.get('limit', 500))
-        except Exception:
-            limit = 500
-        limit = max(1, min(limit, 5000))
+        limit = parse_int_value(request.args.get('limit', 500), 500, min_value=1, max_value=5000)
         event_q = (request.args.get('event') or '').strip()
         code_q = (request.args.get('code') or '').strip().lower()
 
@@ -100,11 +98,7 @@ def register_report_routes(
     @bp.route('/api/reports/daily/list')
     def api_list_daily_reports_route():
         os.makedirs(report_dir, exist_ok=True)
-        try:
-            limit = int(request.args.get('limit', 30))
-        except Exception:
-            limit = 30
-        limit = max(1, min(limit, 365))
+        limit = parse_int_value(request.args.get('limit', 30), 30, min_value=1, max_value=365)
 
         files = [f for f in os.listdir(report_dir) if f.endswith('.json')]
         files.sort(reverse=True)
@@ -192,20 +186,14 @@ def register_report_routes(
 
     @bp.route('/api/preflight')
     def api_preflight_route():
-        try:
-            lookback = int(request.args.get('lookback', 5))
-        except Exception:
-            lookback = 5
+        lookback = parse_int_value(request.args.get('lookback', 5), 5, min_value=1, max_value=90)
         date_q = request.args.get('date')
         assessment = build_preflight_assessment(ref_date=date_q, lookback_days=lookback)
         return jsonify({'success': True, 'assessment': assessment})
 
     @bp.route('/api/analytics/slot-performance')
     def api_slot_performance_route():
-        try:
-            days = int(request.args.get('days', 10))
-        except Exception:
-            days = 10
+        days = parse_int_value(request.args.get('days', 10), 10, min_value=1, max_value=120)
         end_date = request.args.get('date')
         perf = compute_slot_performance(days=days, end_date=end_date)
         hints = build_slot_hints(perf)
@@ -305,11 +293,7 @@ def register_report_routes(
     @bp.route('/api/tuning/history')
     def api_tuning_history_route():
         os.makedirs(tuning_dir, exist_ok=True)
-        try:
-            limit = int(request.args.get('limit', 30))
-        except Exception:
-            limit = 30
-        limit = max(1, min(limit, 365))
+        limit = parse_int_value(request.args.get('limit', 30), 30, min_value=1, max_value=365)
 
         files = [f for f in os.listdir(tuning_dir) if f.endswith('.json')]
         files.sort(reverse=True)
@@ -355,4 +339,3 @@ def register_report_routes(
         })
 
     app.register_blueprint(bp)
-

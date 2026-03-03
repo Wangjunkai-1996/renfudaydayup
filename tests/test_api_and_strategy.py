@@ -178,12 +178,14 @@ def test_management_route_group_still_serves_core_endpoints(load_app):
     history_resp = client.get('/api/history?days=1')
     assert history_resp.status_code == 200
     history_payload = history_resp.get_json()
+    assert history_payload.get('success') is True
     assert 'signals' in history_payload
     assert 'daily_stats' in history_payload
 
     history_bad_days_resp = client.get('/api/history?days=not-a-number')
     assert history_bad_days_resp.status_code == 200
     history_bad_days_payload = history_bad_days_resp.get_json()
+    assert history_bad_days_payload.get('success') is True
     assert 'signals' in history_bad_days_payload
 
 
@@ -224,11 +226,21 @@ def test_history_endpoint_supports_code_and_status_filters(load_app):
     filtered_resp = client.get('/api/history?days=7&code=sh600079&status=success')
     assert filtered_resp.status_code == 200
     filtered_payload = filtered_resp.get_json()
+    assert filtered_payload.get('success') is True
+    assert filtered_payload.get('query', {}).get('code') == 'sh600079'
+    assert filtered_payload.get('query', {}).get('status') == 'success'
     assert len(filtered_payload.get('signals') or []) >= 1
     assert all((item.get('code') or '').lower() == 'sh600079' for item in filtered_payload.get('signals') or [])
     assert all((item.get('status') or '').lower() == 'success' for item in filtered_payload.get('signals') or [])
 
     invalid_status_resp = client.get('/api/history?days=7&status=weird')
-    assert invalid_status_resp.status_code == 200
+    assert invalid_status_resp.status_code == 400
     invalid_status_payload = invalid_status_resp.get_json()
-    assert 'invalid status' in (invalid_status_payload.get('error') or '')
+    assert invalid_status_payload.get('success') is False
+    assert 'invalid status' in (invalid_status_payload.get('msg') or '')
+
+    invalid_date_resp = client.get('/api/history?date=20260303')
+    assert invalid_date_resp.status_code == 400
+    invalid_date_payload = invalid_date_resp.get_json()
+    assert invalid_date_payload.get('success') is False
+    assert 'invalid date' in (invalid_date_payload.get('msg') or '')

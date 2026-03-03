@@ -1,6 +1,11 @@
-import datetime
-
 from flask import Blueprint, jsonify, request
+
+from renfu.history_service import (
+    VALID_SIGNAL_STATUS,
+    is_valid_iso_date,
+    query_signal_history
+)
+from renfu.request_args import parse_int_value
 
 
 def register_management_routes(
@@ -34,10 +39,7 @@ def register_management_routes(
             for code, data_list in market_data.items():
                 if data_list:
                     current_state[code] = {'price': data_list[-1].get('price', 0.0)}
-        try:
-            limit = int(request.args.get('limit', 30))
-        except Exception:
-            limit = 30
+        limit = parse_int_value(request.args.get('limit', 30), 30, min_value=1, max_value=500)
         snapshot = get_paper_snapshot(current_state, recent_limit=limit)
         return jsonify({'success': True, 'paper': snapshot})
 
@@ -142,10 +144,7 @@ def register_management_routes(
 
     @bp.route('/api/config/snapshots', methods=['GET'])
     def api_list_config_snapshots_route():
-        try:
-            limit = int(request.args.get('limit', 30))
-        except Exception:
-            limit = 30
+        limit = parse_int_value(request.args.get('limit', 30), 30, min_value=1, max_value=365)
         items = list_param_versions(limit=limit)
         return jsonify({'success': True, 'items': items})
 
@@ -212,46 +211,25 @@ def register_management_routes(
             date_q = request.args.get('date')
             code_q = (request.args.get('code') or '').strip().lower()
             status_q = (request.args.get('status') or '').strip().lower()
-            if status_q and status_q not in {'pending', 'success', 'fail'}:
-                return jsonify({'error': f'invalid status: {status_q}'})
-            try:
-                days_q = int(request.args.get('days', 7))
-            except Exception:
-                days_q = 7
-            days_q = max(1, min(days_q, 365))
+            days_q = parse_int_value(request.args.get('days', 7), 7, min_value=1, max_value=365)
+            limit_q = parse_int_value(request.args.get('limit', 500), 500, min_value=1, max_value=5000)
 
-            signal_params = []
-            if date_q:
-                signal_sql = 'SELECT * FROM signals WHERE date=?'
-                signal_params.append(date_q)
-                stats = conn.execute('SELECT * FROM daily_stats WHERE date=?', (date_q,)).fetchone()
-            else:
-                since = (datetime.datetime.now() - datetime.timedelta(days=days_q)).strftime('%Y-%m-%d')
-                signal_sql = 'SELECT * FROM signals WHERE date>=?'
-                signal_params.append(since)
-                stats = None
+            if date_q and not is_valid_iso_date(date_q):
+                return jsonify({'success': False, 'msg': f'invalid date: {date_q}, expected YYYY-MM-DD'}), 400
+            if status_q and status_q not in VALID_SIGNAL_STATUS:
+                return jsonify({'success': False, 'msg': f'invalid status: {status_q}'}), 400
 
-            if code_q:
-                signal_sql += ' AND LOWER(code)=?'
-                signal_params.append(code_q)
-            if status_q:
-                signal_sql += ' AND status=?'
-                signal_params.append(status_q)
-
-            if date_q:
-                signal_sql += ' ORDER BY created_at DESC'
-            else:
-                signal_sql += ' ORDER BY date DESC, created_at DESC'
-
-            signals = conn.execute(signal_sql, tuple(signal_params)).fetchall()
-            daily = conn.execute('SELECT * FROM daily_stats ORDER BY date DESC LIMIT ?', (days_q,)).fetchall()
-            return jsonify({
-                'signals': [dict(r) for r in signals],
-                'daily_stats': [dict(r) for r in daily],
-                'date_stats': dict(stats) if stats else None
-            })
+            payload = query_signal_history(
+                conn,
+                date_q=date_q,
+                days_q=days_q,
+                code_q=code_q,
+                status_q=status_q,
+                limit_q=limit_q
+            )
+            return jsonify(payload)
         except Exception as e:
-            return jsonify({'error': str(e)})
+            return jsonify({'success': False, 'msg': str(e)}), 500
         finally:
             if conn is not None:
                 conn.close()

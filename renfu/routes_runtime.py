@@ -4,6 +4,8 @@ import time
 
 from flask import Blueprint, jsonify, request
 
+from renfu.request_args import parse_int_value
+
 
 def register_runtime_routes(
     app,
@@ -70,16 +72,9 @@ def register_runtime_routes(
 
     @bp.route('/api/reports/periodic')
     def api_periodic_reports_route():
-        try:
-            weeks = int(request.args.get('weeks', 8))
-        except Exception:
-            weeks = 8
-        try:
-            months = int(request.args.get('months', 6))
-        except Exception:
-            months = 6
+        weeks = parse_int_value(request.args.get('weeks', 8), 8, min_value=1, max_value=52)
+        months = parse_int_value(request.args.get('months', 6), 6, min_value=1, max_value=24)
         report = build_periodic_report(weeks=weeks, months=months)
         return jsonify({'success': True, 'report': report})
 
     app.register_blueprint(bp)
-

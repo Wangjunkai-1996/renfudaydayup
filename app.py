@@ -43,16 +43,19 @@ STRATEGY_BOOL_KEYS = (
     'buy_require_confirmation', 'buy_reject_bearish_tape',
     'buy_auto_pause', 'close_pending_after_market',
     'debug_log_enabled', 'auto_daily_report_enabled',
-    'time_slot_enabled', 'risk_guard_enabled'
+    'time_slot_enabled', 'risk_guard_enabled',
+    'regime_filter_enabled', 'regime_require_trend_alignment',
+    'regime_block_open_close'
 )
 STRATEGY_FLOAT_KEYS = (
     'win_threshold', 'loss_threshold',
     'buy_min_score', 'sell_min_score', 'buy_pause_min_wr',
-    'risk_daily_profit_floor'
+    'risk_daily_profit_floor', 'regime_target_wr'
 )
 STRATEGY_INT_KEYS = (
     'buy_pause_window', 'buy_pause_min_samples',
-    'risk_max_consecutive_fail', 'risk_pause_minutes'
+    'risk_max_consecutive_fail', 'risk_pause_minutes',
+    'regime_lookback_days', 'regime_min_samples', 'regime_slot_min_samples'
 )
 
 DEFAULT_TIME_SLOT_TEMPLATES = {
@@ -70,7 +73,7 @@ DEFAULT_TIME_SLOT_TEMPLATES = {
 
 UNIT_INTERVAL_FLOAT_KEYS = {
     'win_threshold', 'loss_threshold',
-    'buy_min_score', 'sell_min_score', 'buy_pause_min_wr'
+    'buy_min_score', 'sell_min_score', 'buy_pause_min_wr', 'regime_target_wr'
 }
 
 SIGNED_FLOAT_KEYS = {
@@ -408,6 +411,8 @@ def db_resolve_signal(sig_id, status, resolved_price=0.0, profit_pct=0.0, resolv
         )
         conn.commit()
         conn.close()
+        with state_lock:
+            quality_cache.clear()
     except Exception as e:
         print(f'db resolve error: {e}')
 
@@ -459,6 +464,14 @@ success_rates = {
     'risk_max_consecutive_fail': 4,
     'risk_daily_profit_floor': -2.0,
     'risk_pause_minutes': 30,
+    # 仅在高质量策略窗口开仓，目标胜率保守设为 75%
+    'regime_filter_enabled': True,
+    'regime_target_wr': 0.75,
+    'regime_lookback_days': 10,
+    'regime_min_samples': 20,
+    'regime_slot_min_samples': 5,
+    'regime_require_trend_alignment': True,
+    'regime_block_open_close': True,
     # 调试日志开关（结构化 JSONL）
     'debug_log_enabled': True,
     # 收盘后自动生成日报
@@ -494,6 +507,7 @@ health_state = {
     'stale_seconds_by_code': {},
     'alerts': []
 }
+quality_cache = {}  # key -> {'ts': float, 'value': {...}}
 
 def is_trading_time():
     """A股交易时段检测：工作日 9:30-11:30, 13:00-15:30"""
@@ -732,6 +746,122 @@ def record_buy_outcome(code, is_success):
             buy_outcomes[code] = dq
         dq.append(1 if is_success else 0)
 
+def get_recent_regime_quality(code, sig_type, slot, lookback_days=10):
+    """
+    计算最近 lookback_days 的信号质量：
+    - global: 指定 code + type 的整体胜率
+    - slot: 指定 code + type + slot 的胜率
+    """
+    lookback_days = max(1, min(int(lookback_days), 60))
+    end_date = datetime.datetime.now().date()
+    start_date = end_date - datetime.timedelta(days=lookback_days - 1)
+    key = (str(code), str(sig_type), str(slot), int(lookback_days), start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
+    now_ts = time.time()
+    with state_lock:
+        cached = quality_cache.get(key)
+    if cached and now_ts - float(cached.get('ts', 0.0)) <= 60:
+        return dict(cached.get('value', {}))
+
+    conn = get_db()
+    rows = conn.execute(
+        '''
+        SELECT time, status, profit_pct
+        FROM signals
+        WHERE code=? AND type=? AND date>=? AND date<=? AND status IN ('success','fail')
+        ORDER BY date DESC, time DESC
+        ''',
+        (code, sig_type, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
+    ).fetchall()
+    conn.close()
+
+    sample = 0
+    success = 0
+    profit_sum = 0.0
+    slot_sample = 0
+    slot_success = 0
+    slot_profit_sum = 0.0
+    for r in rows:
+        sample += 1
+        if r['status'] == 'success':
+            success += 1
+        profit_sum += float(r['profit_pct'] or 0.0)
+
+        r_slot = get_time_slot_label(r['time'])
+        if r_slot == slot:
+            slot_sample += 1
+            if r['status'] == 'success':
+                slot_success += 1
+            slot_profit_sum += float(r['profit_pct'] or 0.0)
+
+    value = {
+        'sample': sample,
+        'win_rate': (success / sample) if sample else 0.0,
+        'avg_profit_pct': (profit_sum / sample) if sample else 0.0,
+        'slot_sample': slot_sample,
+        'slot_win_rate': (slot_success / slot_sample) if slot_sample else 0.0,
+        'slot_avg_profit_pct': (slot_profit_sum / slot_sample) if slot_sample else 0.0
+    }
+    with state_lock:
+        quality_cache[key] = {'ts': now_ts, 'value': dict(value)}
+    return value
+
+def evaluate_regime_gate(code, sig, effective):
+    """返回 (accepted, reasons, meta)，用于“只做策略内 T”过滤。"""
+    with state_lock:
+        enabled = bool(success_rates.get('regime_filter_enabled', True))
+        target_wr = float(success_rates.get('regime_target_wr', 0.75))
+        lookback_days = int(success_rates.get('regime_lookback_days', 10))
+        min_samples = int(success_rates.get('regime_min_samples', 20))
+        slot_min_samples = int(success_rates.get('regime_slot_min_samples', 5))
+        require_trend = bool(success_rates.get('regime_require_trend_alignment', True))
+        block_open_close = bool(success_rates.get('regime_block_open_close', True))
+        trend_text = str(stock_contexts.get(code, {}).get('trend', ''))
+        alerts = list(health_state.get('alerts', []))
+
+    if not enabled:
+        return True, [], {'regime_enabled': False}
+
+    sig_type = str(sig.get('type', ''))
+    slot = str(effective.get('slot') or get_time_slot_label(sig.get('time')))
+    quality = get_recent_regime_quality(code, sig_type, slot, lookback_days=lookback_days)
+    reasons = []
+
+    if block_open_close and slot in ('open', 'close'):
+        reasons.append('regime_block_open_close')
+
+    if quality['sample'] >= min_samples and quality['win_rate'] < target_wr:
+        reasons.append('regime_low_wr')
+    if quality['slot_sample'] >= slot_min_samples and quality['slot_win_rate'] < target_wr:
+        reasons.append('regime_slot_low_wr')
+
+    if require_trend:
+        if sig_type == 'BUY' and '空头' in trend_text:
+            reasons.append('regime_trend_not_aligned')
+        elif sig_type == 'SELL' and '多头' in trend_text:
+            reasons.append('regime_trend_not_aligned')
+
+    severe_alerts = []
+    for a in alerts:
+        msg = str(a.get('msg', ''))
+        if ('stale' in msg) or ('worker_errors' in msg) or ('last_fetch_ok' in msg):
+            severe_alerts.append(a)
+    if severe_alerts:
+        reasons.append('regime_health_unstable')
+
+    meta = {
+        'regime_enabled': True,
+        'slot': slot,
+        'target_wr': round(target_wr, 4),
+        'lookback_days': lookback_days,
+        'min_samples': min_samples,
+        'slot_min_samples': slot_min_samples,
+        'trend': trend_text,
+        'quality': quality,
+        'health_alert_count': len(alerts),
+        'severe_alert_count': len(severe_alerts)
+    }
+    return len(reasons) == 0, reasons, meta
+
 def should_accept_signal(code, sig):
     """信号入库前统一风控过滤。返回 (accepted, reasons, meta)。"""
     sig_type = sig.get('type')
@@ -756,13 +886,23 @@ def should_accept_signal(code, sig):
         }
         return False, reasons, meta
 
+    regime_ok, regime_reasons, regime_meta = evaluate_regime_gate(code, sig, effective)
+    if not regime_ok:
+        reasons.extend(regime_reasons)
+        return False, reasons, {
+            'signal_type': sig_type,
+            'slot': effective.get('slot'),
+            'regime_meta': regime_meta
+        }
+
     if sig_type == 'BUY':
         bull_score = float(sig.get('bull_score', parse_signal_score(sig.get('desc', ''))))
         meta = {
             'signal_type': sig_type,
             'score': round(bull_score, 4),
             'threshold': buy_min_score,
-            'slot': effective.get('slot')
+            'slot': effective.get('slot'),
+            'regime_meta': regime_meta
         }
         if bull_score < buy_min_score:
             reasons.append(f"buy_score<{buy_min_score:.2f}")
@@ -797,7 +937,8 @@ def should_accept_signal(code, sig):
             'signal_type': sig_type,
             'score': round(bear_score, 4),
             'threshold': sell_min_score,
-            'slot': effective.get('slot')
+            'slot': effective.get('slot'),
+            'regime_meta': regime_meta
         }
         if not accepted:
             reasons.append(f"sell_score<{sell_min_score:.2f}")
@@ -2333,6 +2474,7 @@ def generate_daily_bundle(target_date, trigger='manual'):
     slot_perf = compute_slot_performance(days=1, end_date=target_date)
     slot_hints = build_slot_hints(slot_perf)
     latest_tuning = get_latest_tuning_for_date(target_date)
+    preflight = build_preflight_assessment(ref_date=target_date, lookback_days=5)
 
     with state_lock:
         runtime = {
@@ -2360,6 +2502,7 @@ def generate_daily_bundle(target_date, trigger='manual'):
         'health_brief': health_brief,
         'slot_performance': slot_perf,
         'slot_hints': slot_hints,
+        'preflight': preflight,
         'latest_tuning': latest_tuning,
         'runtime_snapshot': runtime
     }

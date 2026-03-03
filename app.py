@@ -24,7 +24,24 @@ try:
 except ImportError:
     ak = None
 
+try:
+    from flask_sock import Sock
+except ImportError:
+    Sock = None
+
+from renfu.api_auth import verify_request_token
+from renfu.market_provider import MarketQuoteManager
+from renfu.trade_calendar import TradeCalendar
+from renfu.watchlist_store import (
+    ensure_watchlist_table,
+    list_enabled_codes as watchlist_list_enabled_codes,
+    remove_entry as watchlist_remove_entry,
+    seed_default_if_empty as watchlist_seed_default_if_empty,
+    upsert_entry as watchlist_upsert_entry
+)
+
 app = Flask(__name__)
+sock = Sock(app) if Sock is not None else None
 
 HEADERS = {'Referer': 'http://finance.sina.com.cn'}
 MAX_STOCKS = 3
@@ -32,10 +49,20 @@ MARKET_CLOSE_MINUTE = 15 * 60
 PRE_CLOSE_FLATTEN_MINUTE = 14 * 60 + 57
 PRE_CLOSE_WARN_MINUTE = 14 * 60 + 50
 PAPER_START_CASH = 800000.0
+DEFAULT_WATCHLIST = ['sh600079', 'sh688563']
+API_AUTH_TOKEN = str(os.getenv('API_AUTH_TOKEN', '')).strip()
+API_WRITE_METHODS = {'POST', 'PUT', 'PATCH', 'DELETE'}
+TRADE_CAL_REFRESH_SEC = 6 * 60 * 60
+
+try:
+    API_DATA_MAX_POINTS = max(120, int(os.getenv('API_DATA_MAX_POINTS', '1200')))
+except Exception:
+    API_DATA_MAX_POINTS = 1200
 
 # === SQLite 持久化 ===
-DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data')
-DB_PATH = os.path.join(DB_DIR, 'signals.db')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_DIR = os.getenv('RENFU_DATA_DIR', os.path.join(BASE_DIR, 'data'))
+DB_PATH = os.getenv('RENFU_DB_PATH', os.path.join(DB_DIR, 'signals.db'))
 DEBUG_LOG_DIR = os.path.join(DB_DIR, 'debug_logs')
 REPORT_DIR = os.path.join(DB_DIR, 'reports', 'daily')
 TUNING_DIR = os.path.join(DB_DIR, 'reports', 'tuning')
@@ -48,6 +75,7 @@ STRATEGY_BOOL_KEYS = (
     'buy_auto_pause', 'close_pending_after_market',
     'debug_log_enabled', 'auto_daily_report_enabled',
     'time_slot_enabled', 'risk_guard_enabled',
+    'risk_block_open_slot', 'risk_block_close_slot',
     'regime_filter_enabled', 'regime_require_trend_alignment',
     'regime_block_open_close',
     'paper_trade_enabled', 'paper_auto_execute'
@@ -55,13 +83,15 @@ STRATEGY_BOOL_KEYS = (
 STRATEGY_FLOAT_KEYS = (
     'win_threshold', 'loss_threshold',
     'buy_min_score', 'sell_min_score', 'buy_pause_min_wr',
-    'risk_daily_profit_floor', 'regime_target_wr', 'trade_cost_buffer',
+    'risk_daily_profit_floor', 'risk_max_drawdown_pct',
+    'regime_target_wr', 'trade_cost_buffer',
     'paper_base_order_pct', 'paper_max_stock_pct', 'paper_slippage_pct',
     'paper_commission_rate', 'paper_sell_stamp_tax'
 )
 STRATEGY_INT_KEYS = (
     'buy_pause_window', 'buy_pause_min_samples',
-    'risk_max_consecutive_fail', 'risk_pause_minutes',
+    'risk_max_consecutive_fail', 'risk_stock_max_consecutive_fail',
+    'risk_pause_minutes',
     'regime_lookback_days', 'regime_min_samples', 'regime_slot_min_samples',
     'paper_min_lot'
 )
@@ -354,6 +384,7 @@ def init_db():
             params_json TEXT NOT NULL
         )
     ''')
+    ensure_watchlist_table(conn)
     conn.execute('''
         CREATE TABLE IF NOT EXISTS paper_account (
             id INTEGER PRIMARY KEY CHECK (id=1),
@@ -466,6 +497,18 @@ def rebuild_daily_stats():
     except Exception as e:
         print(f"rebuild daily_stats error: {e}")
 
+def upsert_watchlist_entry(code, name=''):
+    watchlist_upsert_entry(DB_PATH, code=code, name=name)
+
+def remove_watchlist_entry(code):
+    watchlist_remove_entry(DB_PATH, code=code)
+
+def list_enabled_watchlist_codes():
+    return watchlist_list_enabled_codes(DB_PATH)
+
+def seed_default_watchlist_if_empty():
+    watchlist_seed_default_if_empty(DB_PATH, DEFAULT_WATCHLIST)
+
 def db_save_signal(sig):
     try:
         conn = get_db()
@@ -568,8 +611,13 @@ success_rates = {
     # 风控总闸（回撤/连败）
     'risk_guard_enabled': True,
     'risk_max_consecutive_fail': 4,
+    'risk_stock_max_consecutive_fail': 3,
     'risk_daily_profit_floor': -2.0,
+    'risk_max_drawdown_pct': 2.5,
     'risk_pause_minutes': 30,
+    # 时段级风控：可单独屏蔽开盘/尾盘新开仓
+    'risk_block_open_slot': True,
+    'risk_block_close_slot': False,
     # 成本缓冲（净收益判断）：毛收益需超过该比例才记为 success
     'trade_cost_buffer': 0.0012,
     # 模拟交易（80w 起步）执行参数
@@ -606,7 +654,9 @@ last_auto_report_date = ''
 risk_state = {
     'day': '',
     'consecutive_fail': 0,
+    'stock_consecutive_fail': {},
     'daily_profit_pct': 0.0,
+    'peak_daily_profit_pct': 0.0,
     'paused_until_ts': 0.0,
     'pause_reason': '',
     'trigger_count': 0
@@ -620,23 +670,36 @@ health_state = {
     'parse_errors': 0,
     'worker_errors': 0,
     'last_error': '',
+    'quote_provider': {},
     'last_tick_by_code': {},
     'stale_seconds_by_code': {},
     'alerts': []
 }
 quality_cache = {}  # key -> {'ts': float, 'value': {...}}
+trade_calendar = TradeCalendar(
+    ak_module=ak,
+    refresh_sec=TRADE_CAL_REFRESH_SEC
+)
+quote_provider = MarketQuoteManager(headers=HEADERS, timeout=5)
+health_state['quote_provider'] = quote_provider.snapshot()
+
+def refresh_trade_calendar(force=False):
+    trade_calendar.refresh(force=force)
+
+def is_trade_day(dt=None):
+    return trade_calendar.is_trade_day(dt)
 
 def is_trading_time():
-    """A股交易时段检测：工作日 9:30-11:30, 13:00-15:00"""
+    """A股交易时段检测：交易日 9:30-11:30, 13:00-15:00"""
     now = datetime.datetime.now()
-    if now.weekday() >= 5:  # 周末
+    if not is_trade_day(now):
         return False
     t = now.hour * 60 + now.minute
     return (9*60+30 <= t <= 11*60+30) or (13*60 <= t <= MARKET_CLOSE_MINUTE)
 
 def is_pre_close_window(now=None):
     dt = now or datetime.datetime.now()
-    if dt.weekday() >= 5:
+    if not is_trade_day(dt):
         return False
     m = dt.hour * 60 + dt.minute
     return PRE_CLOSE_FLATTEN_MINUTE <= m <= MARKET_CLOSE_MINUTE
@@ -649,7 +712,7 @@ def build_pre_close_alert_snapshot(pending_list, current_state, now=None):
     """
     dt = now or datetime.datetime.now()
     today = dt.strftime('%Y-%m-%d')
-    if dt.weekday() >= 5:
+    if not is_trade_day(dt):
         return {
             'enabled': False,
             'stage': 'off',
@@ -1522,7 +1585,9 @@ def reset_risk_state_for_day(day_str):
     with state_lock:
         risk_state['day'] = day_str
         risk_state['consecutive_fail'] = 0
+        risk_state['stock_consecutive_fail'] = {}
         risk_state['daily_profit_pct'] = 0.0
+        risk_state['peak_daily_profit_pct'] = 0.0
         risk_state['paused_until_ts'] = 0.0
         risk_state['pause_reason'] = ''
         risk_state['trigger_count'] = 0
@@ -1572,6 +1637,19 @@ def update_risk_state_on_resolution(sig, final_status):
 
         profit_pct = float(sig.get('profit_pct') or 0.0)
         risk_state['daily_profit_pct'] = float(risk_state.get('daily_profit_pct', 0.0)) + profit_pct
+        risk_state['peak_daily_profit_pct'] = max(
+            float(risk_state.get('peak_daily_profit_pct', 0.0)),
+            float(risk_state.get('daily_profit_pct', 0.0))
+        )
+
+        code = str(sig.get('code') or '')
+        stock_streak = dict(risk_state.get('stock_consecutive_fail', {}))
+        if final_status == 'fail' and code:
+            stock_streak[code] = int(stock_streak.get(code, 0)) + 1
+        elif code:
+            stock_streak[code] = 0
+        risk_state['stock_consecutive_fail'] = stock_streak
+
         if final_status == 'fail':
             risk_state['consecutive_fail'] = int(risk_state.get('consecutive_fail', 0)) + 1
         else:
@@ -1579,11 +1657,29 @@ def update_risk_state_on_resolution(sig, final_status):
 
         consecutive_fail = int(risk_state.get('consecutive_fail', 0))
         daily_profit = float(risk_state.get('daily_profit_pct', 0.0))
+        peak_profit = float(risk_state.get('peak_daily_profit_pct', 0.0))
+        drawdown = max(0.0, peak_profit - daily_profit)
+        stock_fail_streak = int(stock_streak.get(code, 0)) if code else 0
 
     if consecutive_fail >= int(strategy.get('risk_max_consecutive_fail', 4)):
         maybe_trigger_risk_pause(
             'max_consecutive_fail_reached',
             {'consecutive_fail': consecutive_fail, 'signal_id': sig.get('id')}
+        )
+    if stock_fail_streak >= int(strategy.get('risk_stock_max_consecutive_fail', 3)):
+        maybe_trigger_risk_pause(
+            'stock_consecutive_fail_reached',
+            {'code': code, 'stock_consecutive_fail': stock_fail_streak, 'signal_id': sig.get('id')}
+        )
+    if drawdown >= float(strategy.get('risk_max_drawdown_pct', 2.5)):
+        maybe_trigger_risk_pause(
+            'daily_drawdown_limit_breached',
+            {
+                'drawdown_pct': round(drawdown, 4),
+                'peak_daily_profit_pct': round(peak_profit, 4),
+                'daily_profit_pct': round(daily_profit, 4),
+                'signal_id': sig.get('id')
+            }
         )
     if daily_profit <= float(strategy.get('risk_daily_profit_floor', -2.0)):
         maybe_trigger_risk_pause(
@@ -1599,7 +1695,7 @@ def init_risk_state_from_db():
         conn = get_db()
         rows = conn.execute(
             '''
-            SELECT id, status, profit_pct
+            SELECT id, code, status, profit_pct
             FROM signals
             WHERE date=? AND status IN ('success','fail')
             ORDER BY COALESCE(resolved_at, created_at) ASC
@@ -1612,7 +1708,7 @@ def init_risk_state_from_db():
         return
 
     for r in rows:
-        fake_sig = {'id': r['id'], 'profit_pct': float(r['profit_pct'] or 0.0)}
+        fake_sig = {'id': r['id'], 'code': r['code'], 'profit_pct': float(r['profit_pct'] or 0.0)}
         update_risk_state_on_resolution(fake_sig, r['status'])
 
 def update_health_alerts():
@@ -1622,6 +1718,7 @@ def update_health_alerts():
         request_errors = int(health_state.get('request_errors', 0))
         worker_errors = int(health_state.get('worker_errors', 0))
         last_fetch_ok_ts = float(health_state.get('last_fetch_ok_ts', 0.0))
+        provider_state = dict(health_state.get('quote_provider', {}))
 
     alerts = []
     for code, sec in stale.items():
@@ -1633,6 +1730,12 @@ def update_health_alerts():
         alerts.append({'level': 'warn', 'msg': f'worker_errors={worker_errors}'})
     if last_fetch_ok_ts > 0 and now_ts - last_fetch_ok_ts > 180:
         alerts.append({'level': 'warn', 'msg': f'last_fetch_ok {now_ts-last_fetch_ok_ts:.1f}s ago'})
+    provider = str(provider_state.get('active_provider') or '')
+    fail_count = int(provider_state.get('fail_count') or 0)
+    if provider and provider != 'sina_hq':
+        alerts.append({'level': 'warn', 'msg': f'quote_provider_switched={provider}'})
+    if fail_count > 0:
+        alerts.append({'level': 'warn', 'msg': f'quote_provider_fail_count={fail_count}'})
 
     with state_lock:
         health_state['alerts'] = alerts
@@ -1846,6 +1949,20 @@ def should_accept_signal(code, sig):
     sell_min_score = float(effective.get('sell_min_score', 0.55))
     buy_require_confirmation = bool(effective.get('buy_require_confirmation', True))
     buy_reject_bearish_tape = bool(effective.get('buy_reject_bearish_tape', True))
+    slot = str(effective.get('slot', ''))
+
+    if bool(effective.get('risk_block_open_slot', False)) and slot == 'open':
+        reasons.append('risk_slot_block_open')
+        return False, reasons, {
+            'signal_type': sig_type,
+            'slot': slot
+        }
+    if bool(effective.get('risk_block_close_slot', False)) and slot == 'close':
+        reasons.append('risk_slot_block_close')
+        return False, reasons, {
+            'signal_type': sig_type,
+            'slot': slot
+        }
 
     # 风控总闸：暂停时一律不再开新单
     paused, left_sec, pause_reason = is_risk_paused()
@@ -1932,7 +2049,7 @@ def resolve_pending_after_market_close(force_today=False):
     today = now.strftime('%Y-%m-%d')
 
     # 交易日收盘后，或非交易日处理历史遗留；force_today 用于 14:57 前置平仓。
-    after_close = (now.weekday() < 5) and ((now.hour * 60 + now.minute) > MARKET_CLOSE_MINUTE)
+    after_close = is_trade_day(now) and ((now.hour * 60 + now.minute) > MARKET_CLOSE_MINUTE)
     non_trading = not is_trading_time()
     if not (force_today or after_close or non_trading):
         return
@@ -2491,7 +2608,7 @@ def resolve_stock_code(query):
     except Exception:
         return None
 
-def apply_add_stock(query):
+def apply_add_stock(query, persist=True):
     with state_lock:
         if len(active_stocks) >= MAX_STOCKS:
             return False, f"⚠️ 最多只能监控 {MAX_STOCKS} 只股票"
@@ -2533,12 +2650,17 @@ def apply_add_stock(query):
                     price = float(item['close'])
                     vol = float(item['volume'])
                     amt = float(item['amount'])
+                    point_ts = time.time()
+                    try:
+                        point_ts = datetime.datetime.strptime(item.get('day', ''), '%Y-%m-%d %H:%M:%S').timestamp()
+                    except Exception:
+                        pass
 
                     hist_vol += vol
                     hist_amt += amt
                     curr_vwap = hist_amt / hist_vol if hist_vol > 0 else price
 
-                    preloaded_points.append({'time': dt_time, 'price': price, 'vwap': curr_vwap})
+                    preloaded_points.append({'time': dt_time, 'price': price, 'vwap': curr_vwap, 'ts': point_ts})
                     # 顺便填充分析器价格队列，避免初期信号缺失
                     analyzer.prices.append(price)
         except Exception as e:
@@ -2588,6 +2710,8 @@ def apply_add_stock(query):
                 'strategy': get_strategy_snapshot()
             }
         )
+        if persist:
+            upsert_watchlist_entry(resolved_code, name)
 
         # 异步获取基本面上下文
         threading.Thread(target=fetch_stock_context_bg, args=(resolved_code,), daemon=True).start()
@@ -2595,7 +2719,7 @@ def apply_add_stock(query):
     except Exception as e:
         return False, f"网络请求发生错误: {e}"
 
-def apply_remove_stock(code):
+def apply_remove_stock(code, persist=True):
     removed_name = None
     with state_lock:
         if code in active_stocks:
@@ -2608,14 +2732,25 @@ def apply_remove_stock(code):
             stock_extras.pop(code, None)
             buy_outcomes.pop(code, None)
     if removed_name:
+        if persist:
+            remove_watchlist_entry(code)
         log_debug_event('stock_removed', {'code': code, 'name': removed_name})
 
-# 默认初始化监控：人福医药 + 航材股份
-DEFAULT_WATCHLIST = ['sh600079', 'sh688563']
-for default_code in DEFAULT_WATCHLIST:
-    ok, msg = apply_add_stock(default_code)
-    if not ok:
-        print(f"Default watchlist add failed ({default_code}): {msg}")
+def restore_watchlist_on_startup():
+    seed_default_watchlist_if_empty()
+    watch_codes = list_enabled_watchlist_codes()
+    for code in watch_codes:
+        ok, msg = apply_add_stock(code, persist=False)
+        if ok:
+            with state_lock:
+                restored_name = active_stocks.get(code, '')
+            if restored_name:
+                upsert_watchlist_entry(code, restored_name)
+        else:
+            print(f"Watchlist restore failed ({code}): {msg}")
+
+if not to_bool(os.getenv('SKIP_WATCHLIST_RESTORE', '0')):
+    restore_watchlist_on_startup()
 
 def fetch_worker():
     global signals_history, success_rates, pending_signals
@@ -2651,175 +2786,183 @@ def fetch_worker():
             if not codes:
                 time.sleep(3)
                 continue
-                
-            codes_str = ",".join(codes)
-            url = f"http://hq.sinajs.cn/list={codes_str}"
+
             fetch_start = time.time()
-            response = requests.get(url, headers=HEADERS, timeout=5)
+            quote_result = quote_provider.fetch_quotes(codes)
             fetch_latency_ms = (time.time() - fetch_start) * 1000.0
+            provider_name = quote_result.get('provider', '')
+            quote_rows = quote_result.get('quotes') or {}
+            provider_switched = False
             with state_lock:
+                prev_provider = str((health_state.get('quote_provider') or {}).get('active_provider') or '')
                 health_state['last_fetch_latency_ms'] = round(fetch_latency_ms, 2)
+                health_state['quote_provider'] = quote_provider.snapshot()
+                health_state['quote_provider']['active_provider'] = provider_name
+                health_state['last_fetch_ok_ts'] = time.time()
+                provider_switched = bool(provider_name and provider_name != prev_provider)
+            if provider_switched:
+                log_debug_event(
+                    'quote_provider_switched',
+                    {
+                        'provider': provider_name,
+                        'provider_state': quote_provider.snapshot()
+                    }
+                )
+            now_ts = time.time()
+            current_prices = {}
 
-            if response.status_code == 200:
+            for code, parts in quote_rows.items():
                 with state_lock:
-                    health_state['last_fetch_ok_ts'] = time.time()
-                lines = response.text.strip().split('\n')
-                now_ts = time.time()
-                current_prices = {}
-                
-                for line in lines:
-                    if not line or '=";' in line: continue
-                    parts_eq = line.split('=')
-                    if len(parts_eq) < 2: continue
-                    
-                    code = parts_eq[0].split('_')[-1]
-                    with state_lock:
-                        analyzer = analyzers.get(code)
-                    if not analyzer:
-                        continue
-                    
-                    content = parts_eq[1].replace('"', '').replace(';', '').strip()
-                    parts = content.split(',')
-                    if len(parts) > 30:
-                        volume = int(parts[8])
-                        amount = float(parts[9])
-                        daily_vwap = amount / volume if volume > 0 else 0
-                        current_price = float(parts[3])
-                        dt_time = parts[31]
-                        
-                        if current_price <= 0: continue
-                        current_prices[code] = current_price
-                        
-                        # 存储盘口数据（前端交易窗口用）——零额外开销，数据已在parts里
-                        extras_payload = None
-                        try:
-                            yc = float(parts[2])
-                            op = float(parts[1])
-                            hi = float(parts[4])
-                            lo = float(parts[5])
-                            # 五档盘口
-                            bids = [{'p': float(parts[i+1]), 'v': int(parts[i])} for i in (10,12,14,16,18)]
-                            asks = [{'p': float(parts[i+1]), 'v': int(parts[i])} for i in (20,22,24,26,28)]
-                            if yc > 0:
-                                extras_payload = {
-                                    'yest_close': yc, 'open_price': op,
-                                    'high': hi, 'low': lo,
-                                    'volume': volume, 'amount': amount,
-                                    'bids': bids, 'asks': asks
-                                }
-                        except:
-                            with state_lock:
-                                health_state['parse_errors'] = int(health_state.get('parse_errors', 0)) + 1
-                        if extras_payload:
-                            with state_lock:
-                                if code in active_stocks:
-                                    stock_extras[code] = extras_payload
-                        
+                    analyzer = analyzers.get(code)
+                if not analyzer:
+                    continue
+
+                if len(parts) > 30:
+                    try:
+                        volume = int(float(parts[8] or 0))
+                        amount = float(parts[9] or 0.0)
+                        current_price = float(parts[3] or 0.0)
+                        dt_time = str(parts[31] or '').strip() or datetime.datetime.now().strftime('%H:%M:%S')
+                    except Exception:
                         with state_lock:
-                            data_list = market_data.get(code)
-                            if data_list is None:
-                                continue
+                            health_state['parse_errors'] = int(health_state.get('parse_errors', 0)) + 1
+                        continue
 
-                            # 防重复录入
-                            if len(data_list) > 0 and data_list[-1]['time'] == dt_time:
-                                continue
+                    daily_vwap = amount / volume if volume > 0 else 0
+                    if current_price <= 0:
+                        continue
+                    current_prices[code] = current_price
 
-                            point = {'time': dt_time, 'price': current_price, 'vwap': daily_vwap}
-                            data_list.append(point)
-                            if len(data_list) > 4800:
-                                data_list.pop(0)
-                            health_state['last_tick_by_code'][code] = time.time()
-
-                        # 获取预警信号 (冷却120s)
-                        new_sig = analyzer.get_signal(parts, daily_vwap)
-                        if new_sig:
-                            should_persist = False
-                            with state_lock:
-                                stock_name = active_stocks.get(code)
-                                cooldown_elapsed = now_ts - last_signal_time.get(code, 0)
-
-                            if not stock_name:
-                                continue
-
-                            base_payload = {
-                                'date': datetime.datetime.now().strftime('%Y-%m-%d'),
-                                'time': dt_time,
-                                'code': code,
-                                'name': stock_name,
-                                'signal_type': new_sig.get('type'),
-                                'price': round(float(new_sig.get('price', 0.0)), 4),
-                                'bull_score': round(float(new_sig.get('bull_score', 0.0)), 4),
-                                'bear_score': round(float(new_sig.get('bear_score', 0.0)), 4),
-                                'factors': list(new_sig.get('factors') or []),
-                                'desc': new_sig.get('desc', '')
+                    # 存储盘口数据（前端交易窗口用）——主源有完整盘口，备源兜底为 0。
+                    extras_payload = None
+                    try:
+                        yc = float(parts[2] or 0)
+                        op = float(parts[1] or 0)
+                        hi = float(parts[4] or 0)
+                        lo = float(parts[5] or 0)
+                        # 五档盘口（备源数据缺失时默认 0）
+                        bids = [{'p': float(parts[i+1] or 0), 'v': int(float(parts[i] or 0))} for i in (10,12,14,16,18)]
+                        asks = [{'p': float(parts[i+1] or 0), 'v': int(float(parts[i] or 0))} for i in (20,22,24,26,28)]
+                        if yc > 0:
+                            extras_payload = {
+                                'yest_close': yc, 'open_price': op,
+                                'high': hi, 'low': lo,
+                                'volume': volume, 'amount': amount,
+                                'bids': bids, 'asks': asks
                             }
+                    except Exception:
+                        with state_lock:
+                            health_state['parse_errors'] = int(health_state.get('parse_errors', 0)) + 1
+                    if extras_payload:
+                        with state_lock:
+                            if code in active_stocks:
+                                stock_extras[code] = extras_payload
+
+                    with state_lock:
+                        data_list = market_data.get(code)
+                        if data_list is None:
+                            continue
+
+                        # 防重复录入
+                        if len(data_list) > 0 and data_list[-1]['time'] == dt_time:
+                            continue
+
+                        point = {'time': dt_time, 'price': current_price, 'vwap': daily_vwap, 'ts': now_ts}
+                        data_list.append(point)
+                        if len(data_list) > 4800:
+                            data_list.pop(0)
+                        health_state['last_tick_by_code'][code] = time.time()
+
+                    # 获取预警信号 (冷却120s)
+                    new_sig = analyzer.get_signal(parts, daily_vwap)
+                    if new_sig:
+                        should_persist = False
+                        with state_lock:
+                            stock_name = active_stocks.get(code)
+                            cooldown_elapsed = now_ts - last_signal_time.get(code, 0)
+
+                        if not stock_name:
+                            continue
+
+                        base_payload = {
+                            'date': datetime.datetime.now().strftime('%Y-%m-%d'),
+                            'time': dt_time,
+                            'code': code,
+                            'name': stock_name,
+                            'signal_type': new_sig.get('type'),
+                            'price': round(float(new_sig.get('price', 0.0)), 4),
+                            'bull_score': round(float(new_sig.get('bull_score', 0.0)), 4),
+                            'bear_score': round(float(new_sig.get('bear_score', 0.0)), 4),
+                            'factors': list(new_sig.get('factors') or []),
+                            'desc': new_sig.get('desc', '')
+                        }
+                        new_sig['time'] = dt_time
+
+                        if cooldown_elapsed <= 120:
+                            log_debug_event(
+                                'signal_skipped_cooldown',
+                                {
+                                    **base_payload,
+                                    'cooldown_left_sec': round(120 - cooldown_elapsed, 2),
+                                    'strategy': get_strategy_snapshot()
+                                },
+                                target_date=base_payload['date']
+                            )
+                            continue
+
+                        accepted, reject_reasons, filter_meta = should_accept_signal(code, new_sig)
+                        if not accepted:
+                            log_debug_event(
+                                'signal_rejected',
+                                {
+                                    **base_payload,
+                                    'reasons': reject_reasons,
+                                    'filter_meta': filter_meta,
+                                    'strategy': get_strategy_snapshot()
+                                },
+                                target_date=base_payload['date']
+                            )
+                            continue
+
+                        signal_seq_no = get_next_signal_seq(code, base_payload['date'])
+
+                        with state_lock:
+                            # 入库前再做一次并发态校验
+                            if code not in active_stocks:
+                                continue
+                            if now_ts - last_signal_time.get(code, 0) <= 120:
+                                continue
+
                             new_sig['time'] = dt_time
+                            new_sig['date'] = base_payload['date']
+                            new_sig['code'] = code
+                            new_sig['name'] = active_stocks[code]
+                            new_sig['seq_no'] = signal_seq_no
+                            new_sig['entry_ts'] = now_ts
 
-                            if cooldown_elapsed <= 120:
-                                log_debug_event(
-                                    'signal_skipped_cooldown',
-                                    {
-                                        **base_payload,
-                                        'cooldown_left_sec': round(120 - cooldown_elapsed, 2),
-                                        'strategy': get_strategy_snapshot()
-                                    },
-                                    target_date=base_payload['date']
-                                )
-                                continue
-
-                            accepted, reject_reasons, filter_meta = should_accept_signal(code, new_sig)
-                            if not accepted:
-                                log_debug_event(
-                                    'signal_rejected',
-                                    {
-                                        **base_payload,
-                                        'reasons': reject_reasons,
-                                        'filter_meta': filter_meta,
-                                        'strategy': get_strategy_snapshot()
-                                    },
-                                    target_date=base_payload['date']
-                                )
-                                continue
-
-                            signal_seq_no = get_next_signal_seq(code, base_payload['date'])
-
+                            signals_history.insert(0, new_sig)
+                            if len(signals_history) > 100:
+                                signals_history.pop()
+                            pending_signals.append(new_sig)
+                            success_rates['total'] += 1
+                            last_signal_time[code] = now_ts
+                            should_persist = True
+                        if should_persist:
+                            db_save_signal(new_sig)  # 持久化
+                            log_debug_event(
+                                'signal_accepted',
+                                {
+                                    **base_payload,
+                                    'signal_id': new_sig.get('id'),
+                                    'seq_no': new_sig.get('seq_no'),
+                                    'filter_meta': filter_meta,
+                                    'strategy': get_strategy_snapshot()
+                                },
+                                target_date=base_payload['date']
+                            )
+                            paper_result = maybe_execute_paper_trade(new_sig, current_prices.get(code, new_sig.get('price', 0.0)))
                             with state_lock:
-                                # 入库前再做一次并发态校验
-                                if code not in active_stocks:
-                                    continue
-                                if now_ts - last_signal_time.get(code, 0) <= 120:
-                                    continue
-
-                                new_sig['time'] = dt_time
-                                new_sig['date'] = base_payload['date']
-                                new_sig['code'] = code
-                                new_sig['name'] = active_stocks[code]
-                                new_sig['seq_no'] = signal_seq_no
-                                new_sig['entry_ts'] = now_ts
-
-                                signals_history.insert(0, new_sig)
-                                if len(signals_history) > 100:
-                                    signals_history.pop()
-                                pending_signals.append(new_sig)
-                                success_rates['total'] += 1
-                                last_signal_time[code] = now_ts
-                                should_persist = True
-                            if should_persist:
-                                db_save_signal(new_sig)  # 持久化
-                                log_debug_event(
-                                    'signal_accepted',
-                                    {
-                                        **base_payload,
-                                        'signal_id': new_sig.get('id'),
-                                        'seq_no': new_sig.get('seq_no'),
-                                        'filter_meta': filter_meta,
-                                        'strategy': get_strategy_snapshot()
-                                    },
-                                    target_date=base_payload['date']
-                                )
-                                paper_result = maybe_execute_paper_trade(new_sig, current_prices.get(code, new_sig.get('price', 0.0)))
-                                with state_lock:
-                                    new_sig['paper'] = paper_result
+                                new_sig['paper'] = paper_result
                 
                 # === 移动止损系统 (Trailing Stop) ===
                 db_updates = []
@@ -3001,12 +3144,6 @@ def fetch_worker():
                     db_resolve_signal(sig_id, final_status, resolved_price, gross_profit_pct, profit_pct, resolve_msg, signal_date=sig_date)
                 for e in debug_events:
                     log_debug_event(e.pop('event'), e, target_date=e.get('date'))
-            else:
-                with state_lock:
-                    health_state['request_errors'] = int(health_state.get('request_errors', 0)) + 1
-                    health_state['last_error'] = f'hq status={response.status_code}'
-                log_debug_event('fetch_non_200', {'status_code': response.status_code, 'url': url})
-
             # 刷新数据新鲜度指标
             now_tick = time.time()
             with state_lock:
@@ -3021,7 +3158,9 @@ def fetch_worker():
             print(f"[{time.strftime('%X')}] Worker error: {e}")
             with state_lock:
                 health_state['worker_errors'] = int(health_state.get('worker_errors', 0)) + 1
+                health_state['request_errors'] = int(health_state.get('request_errors', 0)) + 1
                 health_state['last_error'] = str(e)
+                health_state['quote_provider'] = quote_provider.snapshot()
             log_debug_event('worker_error', {'error': str(e)})
             
         time.sleep(3)
@@ -3030,16 +3169,33 @@ def fetch_worker():
 
 from flask import make_response
 
-@app.route('/')
-def index():
-    resp = make_response(render_template('index.html'))
-    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0, max-age=0'
-    resp.headers['Pragma'] = 'no-cache'
-    resp.headers['Expires'] = '-1'
-    return resp
+@app.before_request
+def guard_api_write_endpoints():
+    if verify_request_token(
+        request=request,
+        secret=API_AUTH_TOKEN,
+        path_prefix='/api/',
+        write_methods=API_WRITE_METHODS
+    ):
+        return None
+    return jsonify({'success': False, 'msg': 'unauthorized'}), 401
 
-@app.route('/api/data')
-def get_data():
+def parse_since_ts_arg(raw):
+    text = str(raw or '').strip()
+    if not text:
+        return None
+    try:
+        v = float(text)
+        if v <= 0:
+            return None
+        # 兼容毫秒和秒两种精度
+        return v / 1000.0 if v > 10_000_000_000 else v
+    except Exception:
+        return None
+
+def build_data_payload(since_ts=None, force_full=False):
+    mode = 'delta' if (since_ts is not None and not force_full) else 'full'
+
     with state_lock:
         active_stocks_snapshot = dict(active_stocks)
         market_data_snapshot = {code: list(points) for code, points in market_data.items()}
@@ -3065,6 +3221,20 @@ def get_data():
             'update_time': global_market.get('update_time', '')
         }
 
+    market_payload = {}
+    if mode == 'full':
+        for code, points in market_data_snapshot.items():
+            market_payload[code] = [dict(p) for p in points[-API_DATA_MAX_POINTS:]]
+    else:
+        for code, points in market_data_snapshot.items():
+            fresh_points = []
+            for p in points:
+                p_ts = float(p.get('ts') or 0.0)
+                if p_ts > since_ts:
+                    fresh_points.append(dict(p))
+            if fresh_points:
+                market_payload[code] = fresh_points[-API_DATA_MAX_POINTS:]
+
     current_state = {}
     for code, data_list in market_data_snapshot.items():
         if data_list:
@@ -3078,10 +3248,15 @@ def get_data():
             }
     pre_close_snapshot = build_pre_close_alert_snapshot(pending_snapshot, current_state)
     paper_snapshot = get_paper_snapshot(current_state, recent_limit=20)
+    sync_ts = int(time.time() * 1000)
 
-    return jsonify({
+    return {
+        'success': True,
+        'mode': mode,
+        'sync_ts': sync_ts,
+        'max_points': API_DATA_MAX_POINTS,
         'active_stocks': active_stocks_snapshot,
-        'market_data': market_data_snapshot,
+        'market_data': market_payload,
         'current': current_state,
         'signals': signals_snapshot,
         'stats': stats_snapshot,
@@ -3092,7 +3267,42 @@ def get_data():
         'pre_close': pre_close_snapshot,
         'paper': paper_snapshot,
         'is_trading': is_trading_time()
-    })
+    }
+
+@app.route('/')
+def index():
+    resp = make_response(render_template('index.html'))
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0, max-age=0'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '-1'
+    return resp
+
+@app.route('/api/data')
+def get_data():
+    since_ts = parse_since_ts_arg(request.args.get('since_ts'))
+    force_full = to_bool(request.args.get('full', '0'))
+    return jsonify(build_data_payload(since_ts=since_ts, force_full=force_full))
+
+if sock is not None:
+    @sock.route('/ws/data')
+    def ws_data_stream(ws):
+        """
+        WebSocket 数据流：
+        - 连接后先推一次全量
+        - 后续按时间戳推增量（2 秒）
+        """
+        full_payload = build_data_payload(force_full=True)
+        ws.send(json.dumps(full_payload, ensure_ascii=False))
+        last_sync = float(full_payload.get('sync_ts') or 0) / 1000.0
+
+        while True:
+            try:
+                time.sleep(2)
+                payload = build_data_payload(since_ts=last_sync, force_full=False)
+                last_sync = float(payload.get('sync_ts') or 0) / 1000.0
+                ws.send(json.dumps(payload, ensure_ascii=False))
+            except Exception:
+                break
 
 @app.route('/api/health')
 def api_health():
@@ -3426,6 +3636,133 @@ def get_signal_rows(date_from=None, date_to=None):
     conn.close()
     return [dict(r) for r in rows]
 
+def compute_max_drawdown(curve):
+    peak = 0.0
+    max_dd = 0.0
+    for x in list(curve or []):
+        v = float(x or 0.0)
+        peak = max(peak, v)
+        max_dd = max(max_dd, peak - v)
+    return max_dd
+
+def summarize_period_performance(date_from, date_to, label=''):
+    rows = get_signal_rows(date_from=date_from, date_to=date_to)
+    total = len(rows)
+    success = 0
+    fail = 0
+    pending = 0
+    curve = []
+    cum_profit = 0.0
+    daily_profit_map = collections.defaultdict(float)
+    by_type = collections.defaultdict(lambda: {'total': 0, 'success': 0, 'fail': 0, 'profit_sum': 0.0, 'profit_n': 0})
+
+    for r in rows:
+        sig_type = str(r.get('type') or 'UNKNOWN')
+        by_type[sig_type]['total'] += 1
+        status = str(r.get('status') or '')
+        if status == 'success':
+            success += 1
+            by_type[sig_type]['success'] += 1
+            p = float(r.get('profit_pct') or 0.0)
+            by_type[sig_type]['profit_sum'] += p
+            by_type[sig_type]['profit_n'] += 1
+            cum_profit += p
+            curve.append(cum_profit)
+            daily_profit_map[str(r.get('date') or '')] += p
+        elif status == 'fail':
+            fail += 1
+            by_type[sig_type]['fail'] += 1
+            p = float(r.get('profit_pct') or 0.0)
+            by_type[sig_type]['profit_sum'] += p
+            by_type[sig_type]['profit_n'] += 1
+            cum_profit += p
+            curve.append(cum_profit)
+            daily_profit_map[str(r.get('date') or '')] += p
+        else:
+            pending += 1
+
+    completed = success + fail
+    by_type_out = {}
+    for sig_type, st in by_type.items():
+        comp = st['success'] + st['fail']
+        by_type_out[sig_type] = {
+            'total': st['total'],
+            'success': st['success'],
+            'fail': st['fail'],
+            'win_rate': round(st['success'] * 100.0 / comp, 2) if comp else 0.0,
+            'avg_profit_pct': round(st['profit_sum'] / st['profit_n'], 4) if st['profit_n'] else 0.0
+        }
+
+    daily_curve = []
+    running = 0.0
+    for d in sorted(daily_profit_map.keys()):
+        running += float(daily_profit_map[d])
+        daily_curve.append({'date': d, 'cum_profit_pct': round(running, 4), 'day_profit_pct': round(float(daily_profit_map[d]), 4)})
+
+    return {
+        'label': label,
+        'date_from': date_from,
+        'date_to': date_to,
+        'total': total,
+        'completed': completed,
+        'success': success,
+        'fail': fail,
+        'pending': pending,
+        'win_rate': round(success * 100.0 / completed, 2) if completed else 0.0,
+        'net_profit_pct': round(cum_profit, 4),
+        'avg_profit_pct': round(cum_profit / completed, 4) if completed else 0.0,
+        'max_drawdown_pct': round(compute_max_drawdown(curve), 4),
+        'by_type': by_type_out,
+        'daily_curve': daily_curve
+    }
+
+def shift_month(year, month, delta):
+    y = int(year)
+    m = int(month)
+    total = (y * 12 + (m - 1)) + int(delta)
+    ny = total // 12
+    nm = (total % 12) + 1
+    return ny, nm
+
+def build_periodic_report(weeks=8, months=6):
+    today = datetime.date.today()
+    weeks = max(1, min(int(weeks), 52))
+    months = max(1, min(int(months), 24))
+
+    weekly_items = []
+    week_anchor = today - datetime.timedelta(days=today.weekday())
+    for idx in range(weeks):
+        start = week_anchor - datetime.timedelta(days=idx * 7)
+        end = start + datetime.timedelta(days=6)
+        label = f"{start.isoformat()}~{end.isoformat()}"
+        weekly_items.append(
+            summarize_period_performance(start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'), label=label)
+        )
+    weekly_items.sort(key=lambda x: x.get('date_from', ''))
+
+    monthly_items = []
+    y, m = today.year, today.month
+    for idx in range(months):
+        yy, mm = shift_month(y, m, -idx)
+        start = datetime.date(yy, mm, 1)
+        ny, nm = shift_month(yy, mm, 1)
+        end = datetime.date(ny, nm, 1) - datetime.timedelta(days=1)
+        label = f"{yy:04d}-{mm:02d}"
+        monthly_items.append(
+            summarize_period_performance(start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'), label=label)
+        )
+    monthly_items.sort(key=lambda x: x.get('date_from', ''))
+
+    week_summary = weekly_items[-1] if weekly_items else {}
+    month_summary = monthly_items[-1] if monthly_items else {}
+    return {
+        'generated_at': datetime.datetime.now().isoformat(timespec='seconds'),
+        'week_summary': week_summary,
+        'month_summary': month_summary,
+        'weekly_items': weekly_items,
+        'monthly_items': monthly_items
+    }
+
 def compute_slot_performance(days=1, end_date=None):
     end_date = normalize_date_str(end_date, fallback_today=True)
     if not end_date:
@@ -3751,6 +4088,7 @@ def generate_daily_report(target_date, trigger='manual'):
     debug_entries = read_debug_log_entries(target_date, limit=50000)
     debug_summary = summarize_debug_entries(debug_entries)
     strategy_snapshot = get_strategy_snapshot()
+    periodic = build_periodic_report(weeks=8, months=6)
     report = {
         'date': target_date,
         'generated_at': datetime.datetime.now().isoformat(timespec='seconds'),
@@ -3766,7 +4104,8 @@ def generate_daily_report(target_date, trigger='manual'):
         },
         'by_type': by_type,
         'by_code': by_code,
-        'debug_summary': debug_summary
+        'debug_summary': debug_summary,
+        'periodic': periodic
     }
 
     paths = get_daily_report_paths(target_date)
@@ -3803,6 +4142,23 @@ def generate_daily_report(target_date, trigger='manual'):
             lines.append(f"- {reason}: {cnt}")
     else:
         lines.append("- 无")
+    lines.extend(["", "## 周期表现"])
+    week_summary = periodic.get('week_summary', {})
+    month_summary = periodic.get('month_summary', {})
+    if week_summary:
+        lines.append(
+            f"- 最近一周 {week_summary.get('date_from')}~{week_summary.get('date_to')}: "
+            f"win_rate={float(week_summary.get('win_rate', 0.0)):.2f}%, "
+            f"net_profit_pct={float(week_summary.get('net_profit_pct', 0.0)):+.4f}, "
+            f"max_drawdown_pct={float(week_summary.get('max_drawdown_pct', 0.0)):.4f}"
+        )
+    if month_summary:
+        lines.append(
+            f"- 最近一月 {month_summary.get('date_from')}~{month_summary.get('date_to')}: "
+            f"win_rate={float(month_summary.get('win_rate', 0.0)):.2f}%, "
+            f"net_profit_pct={float(month_summary.get('net_profit_pct', 0.0)):+.4f}, "
+            f"max_drawdown_pct={float(month_summary.get('max_drawdown_pct', 0.0)):.4f}"
+        )
 
     with open(paths['md'], 'w', encoding='utf-8') as f:
         f.write("\n".join(lines) + "\n")
@@ -4091,7 +4447,7 @@ def build_signal_explanation(sig_row):
 
 def get_previous_trading_day(ref_date):
     d = ref_date
-    while d.weekday() >= 5:
+    while not is_trade_day(d):
         d -= datetime.timedelta(days=1)
     return d
 
@@ -4105,10 +4461,10 @@ def maybe_auto_generate_daily_report():
         return
 
     target_date = None
-    # 工作日收盘后生成当日日报；周末兜底生成最近一个交易日
-    if now.weekday() < 5 and (now.hour > 15 or (now.hour == 15 and now.minute >= 5)):
+    # 交易日收盘后生成当日日报；非交易日兜底生成最近一个交易日
+    if is_trade_day(now) and (now.hour > 15 or (now.hour == 15 and now.minute >= 5)):
         target_date = now.strftime('%Y-%m-%d')
-    elif now.weekday() >= 5:
+    elif not is_trade_day(now):
         d = get_previous_trading_day((now - datetime.timedelta(days=1)).date())
         target_date = d.strftime('%Y-%m-%d')
 
@@ -4318,6 +4674,19 @@ def api_slot_performance():
     hints = build_slot_hints(perf)
     return jsonify({'success': True, 'performance': perf, 'hints': hints})
 
+@app.route('/api/reports/periodic')
+def api_periodic_reports():
+    try:
+        weeks = int(request.args.get('weeks', 8))
+    except Exception:
+        weeks = 8
+    try:
+        months = int(request.args.get('months', 6))
+    except Exception:
+        months = 6
+    report = build_periodic_report(weeks=weeks, months=months)
+    return jsonify({'success': True, 'report': report})
+
 @app.route('/api/tuning/suggest')
 def api_tuning_suggest():
     date_q = normalize_date_str(request.args.get('date'), fallback_today=True)
@@ -4496,6 +4865,12 @@ if __name__ == '__main__':
             'strategy': get_strategy_snapshot()
         }
     )
+    if API_AUTH_TOKEN:
+        print("🔐 API 写接口鉴权: 已启用 (X-API-Token)")
+    else:
+        print("⚠️ API 写接口鉴权: 未启用 (可设置环境变量 API_AUTH_TOKEN)")
+    if sock is None:
+        print("⚠️ WebSocket 未启用 (未安装 flask-sock)，前端将回退为轮询模式")
     
     print("🚀 启动人福医药量化策略多只自选版 Web 端...")
     t = threading.Thread(target=fetch_worker, daemon=True)

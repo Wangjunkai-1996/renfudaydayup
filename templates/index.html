@@ -313,6 +313,234 @@
         let lastPreCloseStage = '';
         let baseConfigDirty = false;
         let paperCapitalDirty = false;
+        let lastDataSyncTs = 0;
+        const MAX_CLIENT_POINTS_PER_CODE = 1200;
+        const API_TOKEN_STORAGE_KEY = 'renfu_api_token';
+        let apiToken = '';
+        let authPromptTs = 0;
+        let wsClient = null;
+        let wsConnected = false;
+        let wsRetryTimer = null;
+        let viewState = {
+            active_stocks: {},
+            market_data: {},
+            current: {},
+            signals: [],
+            stats: {},
+            contexts: {},
+            r_breaker: {},
+            extras: {},
+            global: { indices: [], update_time: '' },
+            pre_close: {},
+            paper: null,
+            is_trading: false
+        };
+
+        function bootstrapApiToken() {
+            const params = new URLSearchParams(window.location.search);
+            const fromUrl = (params.get('token') || '').trim();
+            if (fromUrl) {
+                apiToken = fromUrl;
+                localStorage.setItem(API_TOKEN_STORAGE_KEY, fromUrl);
+                return;
+            }
+            apiToken = (localStorage.getItem(API_TOKEN_STORAGE_KEY) || '').trim();
+        }
+
+        function withApiToken(url) {
+            if (!apiToken) return url;
+            try {
+                const u = new URL(url, window.location.origin);
+                if (!u.searchParams.has('token')) {
+                    u.searchParams.set('token', apiToken);
+                }
+                return `${u.pathname}${u.search}`;
+            } catch (e) {
+                return url;
+            }
+        }
+
+        async function apiFetch(url, options = {}) {
+            const opts = { ...options };
+            const headers = new Headers(opts.headers || {});
+            if (apiToken) {
+                headers.set('X-API-Token', apiToken);
+            }
+            opts.headers = headers;
+
+            const resp = await fetch(withApiToken(url), opts);
+            if (resp.status === 401) {
+                const now = Date.now();
+                if (now - authPromptTs > 5000) {
+                    authPromptTs = now;
+                    const nextToken = window.prompt('接口写入需要 API Token，请输入后重试（留空取消）', apiToken || '');
+                    if (nextToken && nextToken.trim()) {
+                        apiToken = nextToken.trim();
+                        localStorage.setItem(API_TOKEN_STORAGE_KEY, apiToken);
+                        reconnectDataSocket();
+                    }
+                }
+            }
+            return resp;
+        }
+
+        function forceFullDataRefresh() {
+            lastDataSyncTs = 0;
+        }
+
+        function mergeDataPayload(payload) {
+            const mode = payload.mode || 'full';
+            const nextActive = payload.active_stocks || {};
+            const incomingMarket = payload.market_data || {};
+
+            if (mode === 'full' || !lastDataSyncTs) {
+                viewState = {
+                    active_stocks: nextActive,
+                    market_data: {},
+                    current: payload.current || {},
+                    signals: payload.signals || [],
+                    stats: payload.stats || {},
+                    contexts: payload.contexts || {},
+                    r_breaker: payload.r_breaker || {},
+                    extras: payload.extras || {},
+                    global: payload.global || { indices: [], update_time: '' },
+                    pre_close: payload.pre_close || {},
+                    paper: payload.paper || null,
+                    is_trading: !!payload.is_trading
+                };
+                Object.keys(incomingMarket).forEach(code => {
+                    const series = Array.isArray(incomingMarket[code]) ? incomingMarket[code] : [];
+                    viewState.market_data[code] = series.slice(-MAX_CLIENT_POINTS_PER_CODE);
+                });
+            } else {
+                viewState.active_stocks = nextActive;
+                const activeSet = new Set(Object.keys(nextActive));
+
+                Object.keys(viewState.market_data).forEach(code => {
+                    if (!activeSet.has(code)) {
+                        delete viewState.market_data[code];
+                    }
+                });
+
+                activeSet.forEach(code => {
+                    if (!Array.isArray(viewState.market_data[code])) {
+                        viewState.market_data[code] = [];
+                    }
+                    const chunk = Array.isArray(incomingMarket[code]) ? incomingMarket[code] : [];
+                    if (chunk.length <= 0) return;
+                    const series = viewState.market_data[code];
+                    chunk.forEach(point => {
+                        const last = series[series.length - 1];
+                        if (last && last.time === point.time) {
+                            series[series.length - 1] = point;
+                        } else {
+                            series.push(point);
+                        }
+                    });
+                    if (series.length > MAX_CLIENT_POINTS_PER_CODE) {
+                        viewState.market_data[code] = series.slice(-MAX_CLIENT_POINTS_PER_CODE);
+                    }
+                });
+
+                viewState.current = payload.current || {};
+                viewState.signals = payload.signals || [];
+                viewState.stats = payload.stats || {};
+                viewState.contexts = payload.contexts || {};
+                viewState.r_breaker = payload.r_breaker || {};
+                viewState.extras = payload.extras || {};
+                viewState.global = payload.global || { indices: [], update_time: '' };
+                viewState.pre_close = payload.pre_close || {};
+                viewState.paper = payload.paper || null;
+                viewState.is_trading = !!payload.is_trading;
+            }
+
+            return viewState;
+        }
+
+        function buildWsUrl() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            let url = `${protocol}//${window.location.host}/ws/data`;
+            if (apiToken) {
+                const u = new URL(url, window.location.origin);
+                u.searchParams.set('token', apiToken);
+                url = u.toString();
+            }
+            return url;
+        }
+
+        function scheduleWsReconnect() {
+            if (wsRetryTimer) return;
+            wsRetryTimer = setTimeout(() => {
+                wsRetryTimer = null;
+                connectDataSocket();
+            }, 3000);
+        }
+
+        function applyIncomingData(payload) {
+            const data = mergeDataPayload(payload || {});
+            if (payload && payload.sync_ts) {
+                lastDataSyncTs = Number(payload.sync_ts);
+            }
+            updateUI(data);
+            renderPreCloseAlerts(data.pre_close || {});
+            renderPaperPanel(data.paper || null, data.active_stocks || {}, data.current || {});
+            fetchStrategyPanels();
+
+            const statusEl = document.getElementById('trading-status');
+            if (statusEl) {
+                if (data.is_trading) {
+                    statusEl.className = 'text-[10px] bg-emerald-600/20 text-emerald-400 border border-emerald-500/30 py-1 px-2 rounded flex items-center gap-1.5';
+                    statusEl.innerHTML = '<div class="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-pulse"></div> 盘中监控';
+                } else {
+                    statusEl.className = 'text-[10px] bg-slate-600/20 text-slate-400 border border-slate-500/30 py-1 px-2 rounded flex items-center gap-1.5';
+                    statusEl.innerHTML = '<div class="w-1.5 h-1.5 bg-slate-500 rounded-full"></div> 休市待命';
+                }
+            }
+        }
+
+        function connectDataSocket() {
+            if (!('WebSocket' in window)) return;
+            if (wsClient && (wsClient.readyState === WebSocket.OPEN || wsClient.readyState === WebSocket.CONNECTING)) {
+                return;
+            }
+
+            try {
+                wsClient = new WebSocket(buildWsUrl());
+            } catch (e) {
+                wsConnected = false;
+                scheduleWsReconnect();
+                return;
+            }
+
+            wsClient.onopen = () => {
+                wsConnected = true;
+            };
+            wsClient.onmessage = (evt) => {
+                try {
+                    const payload = JSON.parse(evt.data || '{}');
+                    applyIncomingData(payload);
+                } catch (e) {
+                    console.error('ws message parse error', e);
+                }
+            };
+            wsClient.onerror = () => {
+                wsConnected = false;
+            };
+            wsClient.onclose = () => {
+                wsConnected = false;
+                scheduleWsReconnect();
+            };
+        }
+
+        function reconnectDataSocket() {
+            if (wsClient) {
+                try {
+                    wsClient.close();
+                } catch (e) { }
+            }
+            wsConnected = false;
+            connectDataSocket();
+        }
 
         // === 信号音效系统 (Web Audio API) ===
         function playSignalSound(type) {
@@ -380,7 +608,7 @@
             const lossVal = parseFloat(document.getElementById('inp-loss').value);
 
             try {
-                const res = await fetch('/api/config', {
+                const res = await apiFetch('/api/config', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ win_threshold: winVal / 100.0, loss_threshold: lossVal / 100.0 })
@@ -392,6 +620,7 @@
                     targetWin = winVal / 100.0;
                     targetLoss = lossVal / 100.0;
                     toggleSettings();
+                    forceFullDataRefresh();
                     fetchData(); // Refresh data to apply new thresholds
                 } else {
                     alert(data.msg || "保存失败");
@@ -408,7 +637,7 @@
             if (!code) return;
 
             try {
-                const res = await fetch('/api/stocks', {
+                const res = await apiFetch('/api/stocks', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ code })
@@ -416,6 +645,7 @@
                 const data = await res.json();
                 if (data.success) {
                     input.value = '';
+                    forceFullDataRefresh();
                     fetchData(); // immediately refresh
                 } else {
                     alert(data.msg);
@@ -426,9 +656,10 @@
         async function removeStock(code) {
             if (!confirm('确定要移除该股票吗?')) return;
             try {
-                const res = await fetch('/api/stocks/' + code, { method: 'DELETE' });
+                const res = await apiFetch('/api/stocks/' + code, { method: 'DELETE' });
                 const data = await res.json();
                 if (data.success) {
+                    forceFullDataRefresh();
                     fetchData();
                 }
             } catch (e) { console.error(e); }
@@ -1182,7 +1413,7 @@
                 });
             });
             try {
-                const res = await fetch('/api/paper/base-config', {
+                const res = await apiFetch('/api/paper/base-config', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ items, apply_seed: reseed, reseed })
@@ -1194,6 +1425,7 @@
                 }
                 baseConfigDirty = false;
                 alert(reseed ? '底仓配置已保存并重建底仓' : '底仓配置已保存');
+                forceFullDataRefresh();
                 fetchData();
             } catch (e) {
                 console.error('save base config error:', e);
@@ -1213,7 +1445,7 @@
                 return;
             }
             try {
-                const res = await fetch('/api/paper/reset', {
+                const res = await apiFetch('/api/paper/reset', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ confirm: true, starting_cash: val })
@@ -1225,6 +1457,7 @@
                 }
                 paperCapitalDirty = false;
                 alert('模拟资金已重置');
+                forceFullDataRefresh();
                 fetchData();
             } catch (e) {
                 console.error('reset paper capital error:', e);
@@ -1331,8 +1564,8 @@
             strategyPanelLoading = true;
             try {
                 const [pfRes, slotRes] = await Promise.all([
-                    fetch('/api/preflight?lookback=7'),
-                    fetch('/api/analytics/slot-performance?days=10')
+                    apiFetch('/api/preflight?lookback=7'),
+                    apiFetch('/api/analytics/slot-performance?days=10')
                 ]);
                 const pfData = await pfRes.json();
                 const slotData = await slotRes.json();
@@ -1352,24 +1585,12 @@
 
         async function fetchData() {
             try {
-                const response = await fetch('/api/data');
-                const data = await response.json();
-                updateUI(data);
-                renderPreCloseAlerts(data.pre_close || {});
-                renderPaperPanel(data.paper || null, data.active_stocks || {}, data.current || {});
-                fetchStrategyPanels();
-
-                // 交易状态指示器
-                const statusEl = document.getElementById('trading-status');
-                if (statusEl) {
-                    if (data.is_trading) {
-                        statusEl.className = 'text-[10px] bg-emerald-600/20 text-emerald-400 border border-emerald-500/30 py-1 px-2 rounded flex items-center gap-1.5';
-                        statusEl.innerHTML = '<div class="w-1.5 h-1.5 bg-emerald-400 rounded-full animate-pulse"></div> 盘中监控';
-                    } else {
-                        statusEl.className = 'text-[10px] bg-slate-600/20 text-slate-400 border border-slate-500/30 py-1 px-2 rounded flex items-center gap-1.5';
-                        statusEl.innerHTML = '<div class="w-1.5 h-1.5 bg-slate-500 rounded-full"></div> 休市待命';
-                    }
-                }
+                if (wsConnected) return;
+                const qs = lastDataSyncTs > 0 ? `?since_ts=${lastDataSyncTs}` : '?full=1';
+                const response = await apiFetch('/api/data' + qs);
+                if (response.status === 401) return;
+                const payload = await response.json();
+                applyIncomingData(payload || {});
             } catch (error) {
                 console.error('Error fetching data:', error);
             }
@@ -1393,7 +1614,7 @@
             const url = dateVal ? `/api/history?date=${dateVal}` : '/api/history?days=14';
 
             try {
-                const res = await fetch(url);
+                const res = await apiFetch(url);
                 const data = await res.json();
 
                 // 每日统计卡片
@@ -1462,6 +1683,9 @@
         }
 
         window.onload = () => {
+            bootstrapApiToken();
+            forceFullDataRefresh();
+            connectDataSocket();
             fetchData();
             fetchStrategyPanels(true);
             setInterval(fetchData, 3000);

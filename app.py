@@ -51,13 +51,18 @@ from renfu.watchlist_store import (
 app = Flask(__name__)
 sock = Sock(app) if Sock is not None else None
 
+def _env_bool(name, default='0'):
+    return str(os.getenv(name, default)).strip().lower() in ('1', 'true', 'yes', 'on')
+
 HEADERS = {'Referer': 'http://finance.sina.com.cn'}
-MAX_STOCKS = 3
+FOCUS_STOCK_CODE = str(os.getenv('FOCUS_STOCK_CODE', 'sh600079')).strip().lower() or 'sh600079'
+SINGLE_STOCK_MODE = _env_bool('RENFU_SINGLE_STOCK_MODE', '1')
+MAX_STOCKS = 1 if SINGLE_STOCK_MODE else 3
 MARKET_CLOSE_MINUTE = 15 * 60
 PRE_CLOSE_FLATTEN_MINUTE = 14 * 60 + 57
 PRE_CLOSE_WARN_MINUTE = 14 * 60 + 50
 PAPER_START_CASH = 800000.0
-DEFAULT_WATCHLIST = ['sh600079', 'sh688563']
+DEFAULT_WATCHLIST = [FOCUS_STOCK_CODE] if SINGLE_STOCK_MODE else ['sh600079', 'sh688563']
 API_AUTH_TOKEN = str(os.getenv('API_AUTH_TOKEN', '')).strip()
 API_WRITE_METHODS = {'POST', 'PUT', 'PATCH', 'DELETE'}
 TRADE_CAL_REFRESH_SEC = 6 * 60 * 60
@@ -66,6 +71,45 @@ try:
     API_DATA_MAX_POINTS = max(120, int(os.getenv('API_DATA_MAX_POINTS', '1200')))
 except Exception:
     API_DATA_MAX_POINTS = 1200
+
+DEFAULT_SIGNAL_PROFILE = {
+    'name': 'generic_intraday_t',
+    'min_points': 10,
+    'min_intraday_range': 0.0040,
+    'vwap_extreme_dev': 0.0100,
+    'vwap_bias_dev': 0.0050,
+    'obi_strong': 0.35,
+    'vol_spike_ratio': 1.8,
+    'signal_threshold': 0.55,
+    'edge_min': 0.15,
+    'same_dir_lock_sec': 1800,
+    'same_dir_price_step': 0.010,
+    'reverse_lock_sec': 1800,
+    'reverse_min_move': 0.010,
+    'gap_reversal_weight': 0.10,
+    'open_range_break_pct': 0.0045
+}
+
+# 人福医药(sh600079)做T专用参数：更强调“高质量、低频”。
+STOCK_SIGNAL_PROFILES = {
+    'sh600079': {
+        'name': 'renfu_intraday_t_v1',
+        'min_points': 12,
+        'min_intraday_range': 0.0065,
+        'vwap_extreme_dev': 0.0090,
+        'vwap_bias_dev': 0.0045,
+        'obi_strong': 0.38,
+        'vol_spike_ratio': 2.0,
+        'signal_threshold': 0.60,
+        'edge_min': 0.18,
+        'same_dir_lock_sec': 2400,
+        'same_dir_price_step': 0.012,
+        'reverse_lock_sec': 2400,
+        'reverse_min_move': 0.012,
+        'gap_reversal_weight': 0.12,
+        'open_range_break_pct': 0.0035
+    }
+}
 
 # === SQLite 持久化 ===
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -105,16 +149,12 @@ STRATEGY_INT_KEYS = (
 )
 
 DEFAULT_TIME_SLOT_TEMPLATES = {
-    # 早盘前半小时噪声大，整体更保守
-    'open': {'buy_min_score': 0.62, 'sell_min_score': 0.57, 'win_threshold': 0.011, 'loss_threshold': 0.007},
-    # 上午中段恢复到常规
-    'morning': {'buy_min_score': 0.58, 'sell_min_score': 0.55},
-    # 午后开盘先观察，BUY 提高门槛
-    'afternoon_open': {'buy_min_score': 0.60, 'sell_min_score': 0.56},
-    # 午后中段常规
-    'afternoon': {'buy_min_score': 0.58, 'sell_min_score': 0.55},
-    # 尾盘减少逆势抄底
-    'close': {'buy_min_score': 0.63, 'sell_min_score': 0.58, 'loss_threshold': 0.007}
+    # 人福医药单票做T模板：宁可少做，优先高置信信号。
+    'open': {'buy_min_score': 0.66, 'sell_min_score': 0.60, 'win_threshold': 0.010, 'loss_threshold': 0.0065},
+    'morning': {'buy_min_score': 0.61, 'sell_min_score': 0.57},
+    'afternoon_open': {'buy_min_score': 0.62, 'sell_min_score': 0.58},
+    'afternoon': {'buy_min_score': 0.60, 'sell_min_score': 0.56},
+    'close': {'buy_min_score': 0.66, 'sell_min_score': 0.60, 'loss_threshold': 0.0065}
 }
 
 UNIT_INTERVAL_FLOAT_KEYS = {
@@ -604,9 +644,9 @@ signals_history = []# 所有股票的信号流
 pending_signals = []# 正在等待出止盈/止损的信号
 success_rates = {
     'total': 0, 'success': 0, 'fail': 0, 'flat': 0, 'pending': 0,
-    'win_threshold': 0.010, 'loss_threshold': 0.008,
+    'win_threshold': 0.009, 'loss_threshold': 0.0068,
     # BUY/SELL 分离过滤参数（默认对 BUY 更严格）
-    'buy_min_score': 0.58, 'sell_min_score': 0.55,
+    'buy_min_score': 0.61, 'sell_min_score': 0.57,
     'buy_require_confirmation': True, 'buy_reject_bearish_tape': True,
     # BUY 自动降噪：近 N 笔胜率过低则临时暂停 BUY
     'buy_auto_pause': True, 'buy_pause_window': 20,
@@ -1545,6 +1585,23 @@ def parse_signal_score(desc):
         return 0.0
     return int(m.group(1)) / 100.0
 
+def get_stock_signal_profile(code):
+    profile = dict(DEFAULT_SIGNAL_PROFILE)
+    custom = STOCK_SIGNAL_PROFILES.get(str(code or '').lower(), {})
+    if isinstance(custom, dict):
+        profile.update(custom)
+    return profile
+
+def parse_minute_of_day(time_str):
+    try:
+        if not time_str or len(time_str) < 5:
+            return -1
+        hh = int(time_str[0:2])
+        mm = int(time_str[3:5])
+        return hh * 60 + mm
+    except Exception:
+        return -1
+
 def get_time_slot_label(time_str=None):
     """按 A 股时段返回 slot label。"""
     try:
@@ -2337,9 +2394,13 @@ class DayTradeAnalyzer:
     """
     def __init__(self, code, window_size=60):
         self.code = code
+        self.profile = get_stock_signal_profile(code)
         self.prices = collections.deque(maxlen=window_size)
         self.tick_volumes = collections.deque(maxlen=window_size)  # 每tick成交量增量
         self.prev_cum_vol = 0  # 上一tick的累计成交量，用于计算增量
+        self.session_day = datetime.datetime.now().strftime('%Y-%m-%d')
+        self.open_range_high = 0.0
+        self.open_range_low = 0.0
         
         # R-Breaker 反转模式前置条件追踪
         self.touched_observe_sell = False  # 日内是否曾触及观察卖出位
@@ -2352,6 +2413,26 @@ class DayTradeAnalyzer:
         
         # R-Breaker parameters
         self.r_breaker = None
+        self._init_r_breaker()
+
+    def _roll_session_if_needed(self, quote_day):
+        day = str(quote_day or '').strip()
+        if not day:
+            return
+        if day == self.session_day:
+            return
+        # 换日后清理仅与日内状态相关的数据，避免昨日状态污染今日信号。
+        self.session_day = day
+        self.prices.clear()
+        self.tick_volumes.clear()
+        self.prev_cum_vol = 0
+        self.touched_observe_sell = False
+        self.touched_observe_buy = False
+        self.open_range_high = 0.0
+        self.open_range_low = 0.0
+        self.last_signal_type = None
+        self.last_signal_price = 0.0
+        self.last_signal_time = 0.0
         self._init_r_breaker()
         
     def _init_r_breaker(self):
@@ -2383,7 +2464,20 @@ class DayTradeAnalyzer:
 
     def get_signal(self, parts, vwap):
         current_price = float(parts[3])
+        quote_day = str(parts[30] or '').strip() if len(parts) > 30 else ''
+        quote_time = str(parts[31] or '').strip() if len(parts) > 31 else ''
+        minute_of_day = parse_minute_of_day(quote_time)
+        self._roll_session_if_needed(quote_day)
         self.prices.append(current_price)
+        profile = self.profile
+        min_points = max(8, int(profile.get('min_points', 10)))
+        min_intraday_range = max(0.0, float(profile.get('min_intraday_range', 0.004)))
+        vwap_extreme_dev = max(0.001, float(profile.get('vwap_extreme_dev', 0.010)))
+        vwap_bias_dev = max(0.001, float(profile.get('vwap_bias_dev', 0.005)))
+        obi_strong = max(0.10, float(profile.get('obi_strong', 0.35)))
+        vol_spike_ratio_threshold = max(1.1, float(profile.get('vol_spike_ratio', 1.8)))
+        gap_reversal_weight = max(0.0, float(profile.get('gap_reversal_weight', 0.10)))
+        open_range_break_pct = max(0.001, float(profile.get('open_range_break_pct', 0.0045)))
         
         # ---- 数据采集 ----
         
@@ -2405,6 +2499,21 @@ class DayTradeAnalyzer:
         except:
             today_high = current_price
             today_low = current_price
+
+        try:
+            open_price = float(parts[1] or 0.0)
+            yest_close = float(parts[2] or 0.0)
+        except Exception:
+            open_price = 0.0
+            yest_close = 0.0
+
+        if 9 * 60 + 30 <= minute_of_day <= 10 * 60 + 30:
+            if self.open_range_high <= 0:
+                self.open_range_high = current_price
+                self.open_range_low = current_price
+            else:
+                self.open_range_high = max(self.open_range_high, current_price)
+                self.open_range_low = min(self.open_range_low, current_price)
         
         # OBI 盘口失衡
         try:
@@ -2415,7 +2524,15 @@ class DayTradeAnalyzer:
         except:
             obi = 0
             
-        if len(self.prices) < 10:
+        if len(self.prices) < min_points:
+            return None
+
+        intraday_range = (today_high - today_low) / current_price if current_price > 0 else 0.0
+        if (
+            minute_of_day >= 10 * 60
+            and minute_of_day < PRE_CLOSE_WARN_MINUTE
+            and intraday_range < min_intraday_range
+        ):
             return None
             
         # ===== 多因子评分引擎 =====
@@ -2471,11 +2588,10 @@ class DayTradeAnalyzer:
         # ── 因子2: VWAP 偏离度 (权重 25%) ──
         if vwap > 0:
             vwap_dev = (current_price - vwap) / vwap
-            abs_dev = abs(vwap_dev)
-            if vwap_dev < -0.010: # 加深负偏离阈值
+            if vwap_dev < -vwap_extreme_dev:
                 bull_score += 0.25
                 factors.append(f"极致超跌({vwap_dev*100:+.1f}%)")
-            elif vwap_dev < -0.005:
+            elif vwap_dev < -vwap_bias_dev:
                 # 均线偏移：只有当开始收窄（V型反转）时才大幅加分
                 if len(self.prices) > 2 and current_price > list(self.prices)[-2]:
                     bull_score += 0.15
@@ -2483,24 +2599,24 @@ class DayTradeAnalyzer:
                 else:
                     bull_score += 0.05
                     factors.append("处于VWAP下方")
-            elif vwap_dev > 0.010:
+            elif vwap_dev > vwap_extreme_dev:
                 bear_score += 0.25
                 factors.append(f"极致超买({vwap_dev*100:+.1f}%)")
-            elif vwap_dev > 0.005:
+            elif vwap_dev > vwap_bias_dev:
                 if len(self.prices) > 2 and current_price < list(self.prices)[-2]:
                     bear_score += 0.15
                     factors.append("冲高回落")
                 else:
                     bear_score += 0.05
                     factors.append("处于VWAP上方")
-        
+
         # ── 因子3: OBI 盘口失衡 (权重 15%) ──
-        if obi > 0.35: # 提高OBI置信度
+        if obi > obi_strong:
             s = 0.15
             bull_score += s
             bear_score -= 0.10 # 强力盘口直接压制反向信号
             factors.append(f"多头强盘口OBI{obi:+.0%}")
-        elif obi < -0.35:
+        elif obi < -obi_strong:
             s = 0.15
             bear_score += s
             bull_score -= 0.10
@@ -2511,7 +2627,7 @@ class DayTradeAnalyzer:
             avg_tick_vol = sum(self.tick_volumes) / len(self.tick_volumes)
             if avg_tick_vol > 0:
                 vol_ratio = tick_vol / avg_tick_vol
-                if vol_ratio > 1.8:
+                if vol_ratio > vol_spike_ratio_threshold:
                     # 放量方向由短期价格动量决定
                     prices_list = list(self.prices)
                     if len(prices_list) >= 3:
@@ -2522,6 +2638,24 @@ class DayTradeAnalyzer:
                         elif short_move < 0:
                             bear_score += 0.15
                             factors.append(f"放量杀跌{vol_ratio:.1f}x")
+
+        # ── 因子4.5: 人福医药增强因子（低开修复/高开回落 + 开盘区间过冲） ──
+        if gap_reversal_weight > 0 and open_price > 0 and yest_close > 0:
+            gap_pct = (open_price - yest_close) / yest_close
+            if gap_pct <= -0.008 and current_price >= open_price:
+                bull_score += gap_reversal_weight
+                factors.append("低开修复")
+            elif gap_pct >= 0.008 and current_price <= open_price:
+                bear_score += gap_reversal_weight
+                factors.append("高开回落")
+
+            if self.open_range_high > 0 and self.open_range_low > 0:
+                if current_price >= self.open_range_high * (1 + open_range_break_pct):
+                    bear_score += gap_reversal_weight * 0.8
+                    factors.append("开盘区间过冲")
+                elif current_price <= self.open_range_low * (1 - open_range_break_pct):
+                    bull_score += gap_reversal_weight * 0.8
+                    factors.append("开盘区间过杀")
         
         # ── 因子5: 日线趋势共振 (权重 15%) ──
         # (深度优化：加大逆势惩罚力度，严防空头行情接飞刀)
@@ -2536,8 +2670,8 @@ class DayTradeAnalyzer:
             factors.append("日线空头共振")
         
         # ===== 信号决策 =====
-        THRESHOLD = 0.55   # 再次提高最低触发分数
-        EDGE_MIN = 0.15    # 多空必须拉开的最小差距
+        THRESHOLD = max(0.40, float(profile.get('signal_threshold', 0.55)))
+        EDGE_MIN = max(0.05, float(profile.get('edge_min', 0.15)))
         
         signal_type = None
         desc = ""
@@ -2555,26 +2689,25 @@ class DayTradeAnalyzer:
         if signal_type:
             # === 防重复与网格过滤系统 ===
             now = time.time()
+            same_dir_lock_sec = max(60, int(profile.get('same_dir_lock_sec', 1800)))
+            same_dir_price_step = max(0.001, float(profile.get('same_dir_price_step', 0.01)))
+            reverse_lock_sec = max(60, int(profile.get('reverse_lock_sec', 1800)))
+            reverse_min_move = max(0.001, float(profile.get('reverse_min_move', 0.01)))
             if self.last_signal_type == signal_type:
                 time_passed = now - self.last_signal_time
                 if signal_type == "BUY":
                     price_diff = (current_price - self.last_signal_price) / self.last_signal_price if self.last_signal_price > 0 else 0
-                    # 同为买点时：只在价格下跌超过1%(网格加仓) 或 距离上次超30分钟 时才再次触发
-                    if time_passed < 1800 and price_diff > -0.01:
+                    if time_passed < same_dir_lock_sec and price_diff > -same_dir_price_step:
                         return None
                 elif signal_type == "SELL":
                     price_diff = (current_price - self.last_signal_price) / self.last_signal_price if self.last_signal_price > 0 else 0
-                    # 同为卖点时：只在价格上涨超过1%(网格分布) 或 距离上次超30分钟 时才再次触发
-                    if time_passed < 1800 and price_diff < 0.01:
+                    if time_passed < same_dir_lock_sec and price_diff < same_dir_price_step:
                         return None
             else:
-                # ====== 新增: 异向冲突过滤 (反向锁死) ======
-                # 如果当前要发出的信号方向和上一次相反(比如上次是买,这次要报卖)
                 time_passed = now - self.last_signal_time
                 if self.last_signal_price > 0:
                     price_diff = abs(current_price - self.last_signal_price) / self.last_signal_price
-                    # 距离上次反向操作不到半小时, 且价格变动甚至没拉开1%的差距：绝对是指标在震荡期反复横跳
-                    if time_passed < 1800 and price_diff < 0.01:
+                    if time_passed < reverse_lock_sec and price_diff < reverse_min_move:
                         return None
             
             # 更新最后一次信号状态
@@ -2591,6 +2724,7 @@ class DayTradeAnalyzer:
                 'bull_score': bull_score,
                 'bear_score': bear_score,
                 'factors': factors,
+                'profile': str(profile.get('name', 'generic_intraday_t')),
                 'status': 'pending', 
             }
         return None
@@ -2747,6 +2881,14 @@ def apply_remove_stock(code, persist=True):
 def restore_watchlist_on_startup():
     seed_default_watchlist_if_empty()
     watch_codes = list_enabled_watchlist_codes()
+    if SINGLE_STOCK_MODE:
+        # 单票模式仅恢复焦点票，避免旧watchlist把多票重新拉起。
+        focus = FOCUS_STOCK_CODE
+        if focus not in watch_codes:
+            upsert_watchlist_entry(focus, '人福医药')
+            watch_codes = [focus]
+        else:
+            watch_codes = [focus]
     for code in watch_codes:
         ok, msg = apply_add_stock(code, persist=False)
         if ok:
@@ -2901,6 +3043,7 @@ def fetch_worker():
                             'price': round(float(new_sig.get('price', 0.0)), 4),
                             'bull_score': round(float(new_sig.get('bull_score', 0.0)), 4),
                             'bear_score': round(float(new_sig.get('bear_score', 0.0)), 4),
+                            'signal_profile': new_sig.get('profile', ''),
                             'factors': list(new_sig.get('factors') or []),
                             'desc': new_sig.get('desc', '')
                         }
@@ -4162,7 +4305,11 @@ if __name__ == '__main__':
     if sock is None:
         print("⚠️ WebSocket 未启用 (未安装 flask-sock)，前端将回退为轮询模式")
     
-    print("🚀 启动人福医药量化策略多只自选版 Web 端...")
+    if SINGLE_STOCK_MODE:
+        print(f"🚀 启动人福医药单票做T专用版 Web 端 (focus={FOCUS_STOCK_CODE})...")
+    else:
+        print("🚀 启动人福医药量化策略多只自选版 Web 端...")
     t = threading.Thread(target=fetch_worker, daemon=True)
     t.start()
-    app.run(port=8080, host='0.0.0.0', debug=False)
+    port = int(os.getenv('PORT', 8080))
+    app.run(port=port, host='0.0.0.0', debug=False)

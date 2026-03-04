@@ -1,8 +1,8 @@
 from flask import Blueprint, jsonify, request
 
+from renfu.date_utils import is_valid_iso_date
 from renfu.history_service import (
     VALID_SIGNAL_STATUS,
-    is_valid_iso_date,
     query_signal_history
 )
 from renfu.request_args import parse_int_value

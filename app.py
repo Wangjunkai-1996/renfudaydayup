@@ -30,7 +30,10 @@ except ImportError:
     Sock = None
 
 from renfu.api_auth import verify_request_token
+from renfu.date_utils import normalize_date_str
+from renfu.debug_summary import summarize_debug_entries
 from renfu.market_provider import MarketQuoteManager
+from renfu.report_compare import compare_reports
 from renfu.routes_management import register_management_routes
 from renfu.routes_reports import register_report_routes
 from renfu.routes_runtime import register_runtime_routes
@@ -3324,43 +3327,6 @@ def read_debug_log_entries(target_date, limit=500):
             continue
     return entries
 
-def summarize_debug_entries(entries):
-    event_counts = collections.Counter()
-    reject_reasons = collections.Counter()
-    by_code = collections.defaultdict(lambda: {'accepted': 0, 'rejected': 0, 'resolved_success': 0, 'resolved_fail': 0})
-    by_type = collections.defaultdict(lambda: {'accepted': 0, 'rejected': 0, 'resolved_success': 0, 'resolved_fail': 0})
-
-    for e in entries:
-        evt = e.get('event', '')
-        event_counts[evt] += 1
-        code = str(e.get('code', ''))
-        sig_type = str(e.get('signal_type', ''))
-
-        if evt == 'signal_rejected':
-            by_code[code]['rejected'] += 1
-            by_type[sig_type]['rejected'] += 1
-            for r in e.get('reasons') or []:
-                reject_reasons[str(r)] += 1
-        elif evt == 'signal_accepted':
-            by_code[code]['accepted'] += 1
-            by_type[sig_type]['accepted'] += 1
-        elif evt in ('signal_resolved', 'signal_force_closed'):
-            status = e.get('status')
-            if status == 'success':
-                by_code[code]['resolved_success'] += 1
-                by_type[sig_type]['resolved_success'] += 1
-            elif status == 'fail':
-                by_code[code]['resolved_fail'] += 1
-                by_type[sig_type]['resolved_fail'] += 1
-
-    return {
-        'event_counts': dict(event_counts),
-        'reject_reasons': dict(reject_reasons),
-        'by_code': dict(by_code),
-        'by_type': dict(by_type),
-        'sample_size': len(entries)
-    }
-
 def get_daily_report_paths(target_date):
     os.makedirs(REPORT_DIR, exist_ok=True)
     return {
@@ -3952,35 +3918,6 @@ def get_or_generate_daily_report(target_date, trigger='auto'):
         report, paths = generate_daily_report(target_date, trigger=trigger)
     return report, paths
 
-def compare_reports(current_report, baseline_report):
-    def diff(a, b):
-        return round(float(a) - float(b), 4)
-
-    cur_tot = current_report.get('totals', {})
-    base_tot = baseline_report.get('totals', {})
-    totals_diff = {k: diff(cur_tot.get(k, 0), base_tot.get(k, 0)) for k in ('total', 'success', 'fail', 'pending', 'completed', 'win_rate')}
-
-    type_diff = {}
-    cur_type = current_report.get('by_type', {})
-    base_type = baseline_report.get('by_type', {})
-    for t in set(list(cur_type.keys()) + list(base_type.keys())):
-        c = cur_type.get(t, {})
-        b = base_type.get(t, {})
-        type_diff[t] = {k: diff(c.get(k, 0), b.get(k, 0)) for k in ('total', 'success', 'fail', 'pending', 'win_rate', 'avg_profit_pct')}
-
-    cur_rej = current_report.get('debug_summary', {}).get('reject_reasons', {})
-    base_rej = baseline_report.get('debug_summary', {}).get('reject_reasons', {})
-    reason_diff = {}
-    for k in set(list(cur_rej.keys()) + list(base_rej.keys())):
-        reason_diff[k] = int(cur_rej.get(k, 0)) - int(base_rej.get(k, 0))
-    reason_diff = dict(sorted(reason_diff.items(), key=lambda x: abs(x[1]), reverse=True)[:15])
-
-    return {
-        'totals_diff': totals_diff,
-        'by_type_diff': type_diff,
-        'reject_reason_diff': reason_diff
-    }
-
 def build_param_suggestion(target_date, baseline_date=None):
     report, _ = get_or_generate_daily_report(target_date, trigger='suggestion')
     baseline_report = None
@@ -4056,14 +3993,6 @@ def build_param_suggestion(target_date, baseline_date=None):
         },
         'compare': compare
     }
-
-def normalize_date_str(date_str, fallback_today=False):
-    if not date_str:
-        return datetime.datetime.now().strftime('%Y-%m-%d') if fallback_today else None
-    try:
-        return datetime.datetime.strptime(str(date_str), '%Y-%m-%d').strftime('%Y-%m-%d')
-    except Exception:
-        return None
 
 def get_default_baseline_date(target_date):
     try:

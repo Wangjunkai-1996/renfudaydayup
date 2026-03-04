@@ -36,3 +36,7 @@ Validation behavior:
 
 - Write APIs under `/api/` still use token guard from `app.py` middleware.
 - Existing payload fields for `/api/history` are kept (`signals`, `daily_stats`, `date_stats`) and now include `success` and `query` metadata.
+- Shared helper modules:
+  - `renfu/request_args.py` for integer query parsing/clamping.
+  - `renfu/history_service.py` for history SQL assembly and payload shape.
+  - `renfu/date_utils.py`, `renfu/report_compare.py`, `renfu/debug_summary.py` for reusable report/date utilities.

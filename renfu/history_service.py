@@ -4,14 +4,6 @@ import datetime
 VALID_SIGNAL_STATUS = {'pending', 'success', 'fail'}
 
 
-def is_valid_iso_date(date_str):
-    try:
-        datetime.date.fromisoformat(str(date_str))
-        return True
-    except Exception:
-        return False
-
-
 def query_signal_history(
     conn,
     *,

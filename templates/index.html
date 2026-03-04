@@ -1055,6 +1055,21 @@
                     const seqText = (sig.seq_no && Number(sig.seq_no) > 0)
                         ? `<span class="text-[10px] text-slate-400 bg-slate-700/50 border border-slate-600 rounded px-1.5 py-0.5">第${Number(sig.seq_no)}单</span>`
                         : '';
+                    const paperInfo = sig.paper || {};
+                    const paperOrder = paperInfo.order || {};
+                    const tAmount = Number(paperOrder.amount || 0);
+                    const tQty = Number(paperOrder.qty || 0);
+                    const tCfgAmount = Number(paperOrder.t_order_amount || 0);
+                    const tRemainBefore = Number(paperOrder.t_remaining_before || 0);
+                    const tReason = paperOrder.reason ? formatPaperReason(paperOrder.reason) : '';
+                    const tAmountText = tAmount > 0 ? `¥${moneyFmt(tAmount)}` : (tCfgAmount > 0 ? `计划 ¥${moneyFmt(tCfgAmount)}` : '--');
+                    let tTradeInfo = '';
+                    if (tAmount > 0 || tCfgAmount > 0 || tQty > 0) {
+                        const qtyText = tQty > 0 ? `${tQty}股` : '--';
+                        const remText = tRemainBefore > 0 ? ` · 剩余额度 ¥${moneyFmt(tRemainBefore)}` : '';
+                        const reasonText = tReason ? ` · ${escapeHtml(tReason)}` : '';
+                        tTradeInfo = `💵 做T金额 ${tAmountText} · 数量 ${qtyText}${remText}${reasonText}`;
+                    }
 
                     let statusColor = "text-slate-400";
                     let statusText = `移动止损中 (盈+${(targetWin * 100).toFixed(1)}% / 损-${(targetLoss * 100).toFixed(1)}%)...`;
@@ -1087,6 +1102,11 @@
                         <div class="text-slate-300 text-[13px] leading-relaxed mb-3">
                             ${safeDesc}
                         </div>
+                        ${tTradeInfo ? `
+                        <div class="mb-2 text-[11px] text-cyan-300 bg-cyan-500/5 border border-cyan-500/20 rounded px-2 py-1">
+                            ${tTradeInfo}
+                        </div>
+                        ` : ''}
                         <div class="flex flex-col">
                             <div class="flex justify-between items-center bg-slate-900/60 rounded-t p-2">
                                 <div class="font-mono text-lg font-bold ${sig.type === 'BUY' ? 'text-emerald-400' : 'text-rose-400'}">

@@ -1450,6 +1450,34 @@ def maybe_execute_paper_trade(sig, market_price):
     )
     return {'executed': False, 'status': result.get('status', 'rejected'), 'order': result}
 
+def get_latest_paper_orders_for_signal_ids(signal_ids):
+    ids = [str(i or '').strip() for i in signal_ids if str(i or '').strip()]
+    if not ids:
+        return {}
+    placeholders = ','.join('?' for _ in ids)
+    sql = f'''
+        SELECT signal_id, order_id, date, time, code, name, side, qty, price, amount, fee, status, reason, created_at
+        FROM paper_orders
+        WHERE signal_id IN ({placeholders})
+        ORDER BY created_at DESC
+    '''
+    conn = get_db()
+    rows = conn.execute(sql, tuple(ids)).fetchall()
+    conn.close()
+
+    mapping = {}
+    for r in rows:
+        sig_id = str(r['signal_id'] or '').strip()
+        if not sig_id or sig_id in mapping:
+            continue
+        order = dict(r)
+        mapping[sig_id] = {
+            'executed': str(order.get('status', '')) == 'filled',
+            'status': order.get('status', 'unknown'),
+            'order': order
+        }
+    return mapping
+
 def get_paper_snapshot(current_state=None, recent_limit=30):
     current_state = current_state or {}
     paper_rollover_if_new_day()
@@ -3445,6 +3473,17 @@ def build_data_payload(since_ts=None, force_full=False):
             visible_stock_stats[sc] = {'success': 0, 'fail': 0}
         visible_stock_stats[sc][st] += 1
     stats_snapshot['stocks'] = visible_stock_stats
+
+    # 为信号补齐模拟成交信息，便于前端展示“本单做T金额/股数”。
+    signal_ids = [s.get('id') for s in signals_snapshot]
+    paper_map = get_latest_paper_orders_for_signal_ids(signal_ids)
+    if paper_map:
+        for s in signals_snapshot:
+            sig_id = str(s.get('id') or '')
+            if not sig_id or s.get('paper'):
+                continue
+            if sig_id in paper_map:
+                s['paper'] = paper_map[sig_id]
 
     market_payload = {}
     if mode == 'full':

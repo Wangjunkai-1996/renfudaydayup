@@ -612,6 +612,25 @@ def db_resolve_signal(sig_id, status, resolved_price=0.0, gross_profit_pct=0.0, 
     except Exception as e:
         print(f'db resolve error: {e}')
 
+def db_delete_signals_by_code(code, target_date=None):
+    """
+    删除指定股票信号（默认仅当天），用于移除自选后清理信号列表。
+    """
+    c = str(code or '').strip().lower()
+    if not c:
+        return 0
+    day = str(target_date or datetime.datetime.now().strftime('%Y-%m-%d'))
+    conn = get_db()
+    cur = conn.execute('DELETE FROM signals WHERE code=? AND date=?', (c, day))
+    deleted = int(cur.rowcount or 0)
+    conn.commit()
+    conn.close()
+    if deleted > 0:
+        rebuild_daily_stats()
+        with state_lock:
+            quality_cache.clear()
+    return deleted
+
 def load_today_signals():
     """启动时恢复今日信号记录"""
     try:
@@ -2862,21 +2881,59 @@ def apply_add_stock(query, persist=True):
         return False, f"网络请求发生错误: {e}"
 
 def apply_remove_stock(code, persist=True):
+    c = str(code or '').strip().lower()
+    if not c:
+        return
     removed_name = None
+    purged_runtime = 0
     with state_lock:
-        if code in active_stocks:
-            removed_name = active_stocks.get(code, '')
-            del active_stocks[code]
-            market_data.pop(code, None)
-            analyzers.pop(code, None)
-            last_signal_time.pop(code, None)
-            stock_contexts.pop(code, None)
-            stock_extras.pop(code, None)
-            buy_outcomes.pop(code, None)
+        if c in active_stocks:
+            removed_name = active_stocks.get(c, '')
+            del active_stocks[c]
+            market_data.pop(c, None)
+            analyzers.pop(c, None)
+            last_signal_time.pop(c, None)
+            stock_contexts.pop(c, None)
+            stock_extras.pop(c, None)
+            buy_outcomes.pop(c, None)
+            risk_state.get('stock_consecutive_fail', {}).pop(c, None)
+
+            before_count = len(signals_history)
+            signals_history[:] = [s for s in signals_history if str(s.get('code', '')).lower() != c]
+            pending_signals[:] = [s for s in pending_signals if str(s.get('code', '')).lower() != c]
+            purged_runtime = max(0, before_count - len(signals_history))
+
+            today = datetime.datetime.now().strftime('%Y-%m-%d')
+            day_rows = [s for s in signals_history if str(s.get('date') or today) == today]
+            success_rates['total'] = len(day_rows)
+            success_rates['success'] = sum(1 for s in day_rows if s.get('status') == 'success')
+            success_rates['fail'] = sum(1 for s in day_rows if s.get('status') == 'fail')
+            success_rates['flat'] = sum(1 for s in day_rows if s.get('status') == 'flat')
+            success_rates['pending'] = len(pending_signals)
+
+            stock_stats = {}
+            for s in day_rows:
+                sc = str(s.get('code') or '').lower()
+                st = str(s.get('status') or '')
+                if not sc or st not in ('success', 'fail'):
+                    continue
+                if sc not in stock_stats:
+                    stock_stats[sc] = {'success': 0, 'fail': 0}
+                stock_stats[sc][st] += 1
+            success_rates['stocks'] = stock_stats
     if removed_name:
         if persist:
-            remove_watchlist_entry(code)
-        log_debug_event('stock_removed', {'code': code, 'name': removed_name})
+            remove_watchlist_entry(c)
+        purged_db = db_delete_signals_by_code(c)
+        log_debug_event(
+            'stock_removed',
+            {
+                'code': c,
+                'name': removed_name,
+                'purged_runtime_signals': purged_runtime,
+                'purged_db_signals': purged_db
+            }
+        )
 
 def restore_watchlist_on_startup():
     seed_default_watchlist_if_empty()
@@ -3358,6 +3415,36 @@ def build_data_payload(since_ts=None, force_full=False):
             'indices': [dict(item) for item in global_market.get('indices', [])],
             'update_time': global_market.get('update_time', '')
         }
+
+    active_code_set = set(active_stocks_snapshot.keys())
+    if active_code_set:
+        signals_snapshot = [
+            s for s in signals_snapshot
+            if str(s.get('code') or '').lower() in active_code_set
+        ]
+        pending_snapshot = [
+            s for s in pending_snapshot
+            if str(s.get('code') or '').lower() in active_code_set
+        ]
+    else:
+        signals_snapshot = []
+        pending_snapshot = []
+
+    stats_snapshot['total'] = len(signals_snapshot)
+    stats_snapshot['success'] = sum(1 for s in signals_snapshot if s.get('status') == 'success')
+    stats_snapshot['fail'] = sum(1 for s in signals_snapshot if s.get('status') == 'fail')
+    stats_snapshot['flat'] = sum(1 for s in signals_snapshot if s.get('status') == 'flat')
+    stats_snapshot['pending'] = len(pending_snapshot)
+    visible_stock_stats = {}
+    for s in signals_snapshot:
+        sc = str(s.get('code') or '').lower()
+        st = str(s.get('status') or '')
+        if not sc or st not in ('success', 'fail'):
+            continue
+        if sc not in visible_stock_stats:
+            visible_stock_stats[sc] = {'success': 0, 'fail': 0}
+        visible_stock_stats[sc][st] += 1
+    stats_snapshot['stocks'] = visible_stock_stats
 
     market_payload = {}
     if mode == 'full':

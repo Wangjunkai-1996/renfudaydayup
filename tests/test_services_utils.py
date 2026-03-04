@@ -3,8 +3,9 @@ import sqlite3
 from renfu.date_utils import is_valid_iso_date, normalize_date_str
 from renfu.debug_summary import summarize_debug_entries
 from renfu.history_service import query_signal_history
+from renfu.periodic_report_service import build_periodic_report
 from renfu.report_compare import compare_reports
-from renfu.request_args import parse_int_value
+from renfu.request_args import parse_int_value, parse_since_ts_arg
 
 
 def test_parse_int_value_fallback_and_clamp():
@@ -12,6 +13,13 @@ def test_parse_int_value_fallback_and_clamp():
     assert parse_int_value('bad', 5) == 5
     assert parse_int_value('-9', 5, min_value=1) == 1
     assert parse_int_value('99', 5, max_value=10) == 10
+
+
+def test_parse_since_ts_arg_accepts_seconds_and_milliseconds():
+    assert parse_since_ts_arg('1700000000') == 1700000000.0
+    assert parse_since_ts_arg('1700000000000') == 1700000000.0
+    assert parse_since_ts_arg('bad') is None
+    assert parse_since_ts_arg('-3') is None
 
 
 def test_date_utils_normalize_and_validate():
@@ -106,3 +114,19 @@ def test_query_signal_history_with_filters():
     assert payload['query']['status'] == 'success'
     assert len(payload['signals']) == 1
     assert payload['signals'][0]['code'] == 'sh600079'
+
+
+def test_build_periodic_report_with_mock_rows():
+    def fake_get_signal_rows(date_from=None, date_to=None):
+        return [
+            {'date': date_from, 'type': 'BUY', 'status': 'success', 'profit_pct': 1.2},
+            {'date': date_from, 'type': 'BUY', 'status': 'fail', 'profit_pct': -0.4},
+            {'date': date_from, 'type': 'SELL', 'status': 'pending', 'profit_pct': 0.0},
+        ]
+
+    report = build_periodic_report(fake_get_signal_rows, weeks=2, months=2)
+    assert len(report.get('weekly_items') or []) == 2
+    assert len(report.get('monthly_items') or []) == 2
+    week_summary = report.get('week_summary') or {}
+    assert week_summary.get('total') == 3
+    assert week_summary.get('completed') == 2

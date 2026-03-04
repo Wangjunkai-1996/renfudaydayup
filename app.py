@@ -33,7 +33,9 @@ from renfu.api_auth import verify_request_token
 from renfu.date_utils import normalize_date_str
 from renfu.debug_summary import summarize_debug_entries
 from renfu.market_provider import MarketQuoteManager
+from renfu.periodic_report_service import build_periodic_report as build_periodic_report_data
 from renfu.report_compare import compare_reports
+from renfu.request_args import parse_since_ts_arg
 from renfu.routes_management import register_management_routes
 from renfu.routes_reports import register_report_routes
 from renfu.routes_runtime import register_runtime_routes
@@ -3186,19 +3188,6 @@ def guard_api_write_endpoints():
         return None
     return jsonify({'success': False, 'msg': 'unauthorized'}), 401
 
-def parse_since_ts_arg(raw):
-    text = str(raw or '').strip()
-    if not text:
-        return None
-    try:
-        v = float(text)
-        if v <= 0:
-            return None
-        # 兼容毫秒和秒两种精度
-        return v / 1000.0 if v > 10_000_000_000 else v
-    except Exception:
-        return None
-
 def build_data_payload(since_ts=None, force_full=False):
     mode = 'delta' if (since_ts is not None and not force_full) else 'full'
 
@@ -3361,132 +3350,8 @@ def get_signal_rows(date_from=None, date_to=None):
     conn.close()
     return [dict(r) for r in rows]
 
-def compute_max_drawdown(curve):
-    peak = 0.0
-    max_dd = 0.0
-    for x in list(curve or []):
-        v = float(x or 0.0)
-        peak = max(peak, v)
-        max_dd = max(max_dd, peak - v)
-    return max_dd
-
-def summarize_period_performance(date_from, date_to, label=''):
-    rows = get_signal_rows(date_from=date_from, date_to=date_to)
-    total = len(rows)
-    success = 0
-    fail = 0
-    pending = 0
-    curve = []
-    cum_profit = 0.0
-    daily_profit_map = collections.defaultdict(float)
-    by_type = collections.defaultdict(lambda: {'total': 0, 'success': 0, 'fail': 0, 'profit_sum': 0.0, 'profit_n': 0})
-
-    for r in rows:
-        sig_type = str(r.get('type') or 'UNKNOWN')
-        by_type[sig_type]['total'] += 1
-        status = str(r.get('status') or '')
-        if status == 'success':
-            success += 1
-            by_type[sig_type]['success'] += 1
-            p = float(r.get('profit_pct') or 0.0)
-            by_type[sig_type]['profit_sum'] += p
-            by_type[sig_type]['profit_n'] += 1
-            cum_profit += p
-            curve.append(cum_profit)
-            daily_profit_map[str(r.get('date') or '')] += p
-        elif status == 'fail':
-            fail += 1
-            by_type[sig_type]['fail'] += 1
-            p = float(r.get('profit_pct') or 0.0)
-            by_type[sig_type]['profit_sum'] += p
-            by_type[sig_type]['profit_n'] += 1
-            cum_profit += p
-            curve.append(cum_profit)
-            daily_profit_map[str(r.get('date') or '')] += p
-        else:
-            pending += 1
-
-    completed = success + fail
-    by_type_out = {}
-    for sig_type, st in by_type.items():
-        comp = st['success'] + st['fail']
-        by_type_out[sig_type] = {
-            'total': st['total'],
-            'success': st['success'],
-            'fail': st['fail'],
-            'win_rate': round(st['success'] * 100.0 / comp, 2) if comp else 0.0,
-            'avg_profit_pct': round(st['profit_sum'] / st['profit_n'], 4) if st['profit_n'] else 0.0
-        }
-
-    daily_curve = []
-    running = 0.0
-    for d in sorted(daily_profit_map.keys()):
-        running += float(daily_profit_map[d])
-        daily_curve.append({'date': d, 'cum_profit_pct': round(running, 4), 'day_profit_pct': round(float(daily_profit_map[d]), 4)})
-
-    return {
-        'label': label,
-        'date_from': date_from,
-        'date_to': date_to,
-        'total': total,
-        'completed': completed,
-        'success': success,
-        'fail': fail,
-        'pending': pending,
-        'win_rate': round(success * 100.0 / completed, 2) if completed else 0.0,
-        'net_profit_pct': round(cum_profit, 4),
-        'avg_profit_pct': round(cum_profit / completed, 4) if completed else 0.0,
-        'max_drawdown_pct': round(compute_max_drawdown(curve), 4),
-        'by_type': by_type_out,
-        'daily_curve': daily_curve
-    }
-
-def shift_month(year, month, delta):
-    y = int(year)
-    m = int(month)
-    total = (y * 12 + (m - 1)) + int(delta)
-    ny = total // 12
-    nm = (total % 12) + 1
-    return ny, nm
-
 def build_periodic_report(weeks=8, months=6):
-    today = datetime.date.today()
-    weeks = max(1, min(int(weeks), 52))
-    months = max(1, min(int(months), 24))
-
-    weekly_items = []
-    week_anchor = today - datetime.timedelta(days=today.weekday())
-    for idx in range(weeks):
-        start = week_anchor - datetime.timedelta(days=idx * 7)
-        end = start + datetime.timedelta(days=6)
-        label = f"{start.isoformat()}~{end.isoformat()}"
-        weekly_items.append(
-            summarize_period_performance(start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'), label=label)
-        )
-    weekly_items.sort(key=lambda x: x.get('date_from', ''))
-
-    monthly_items = []
-    y, m = today.year, today.month
-    for idx in range(months):
-        yy, mm = shift_month(y, m, -idx)
-        start = datetime.date(yy, mm, 1)
-        ny, nm = shift_month(yy, mm, 1)
-        end = datetime.date(ny, nm, 1) - datetime.timedelta(days=1)
-        label = f"{yy:04d}-{mm:02d}"
-        monthly_items.append(
-            summarize_period_performance(start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'), label=label)
-        )
-    monthly_items.sort(key=lambda x: x.get('date_from', ''))
-
-    week_summary = weekly_items[-1] if weekly_items else {}
-    month_summary = monthly_items[-1] if monthly_items else {}
-    return {
-        'generated_at': datetime.datetime.now().isoformat(timespec='seconds'),
-        'week_summary': week_summary,
-        'month_summary': month_summary,
-        'weekly_items': weekly_items,
-        'monthly_items': monthly_items
-    }
+    return build_periodic_report_data(get_signal_rows, weeks=weeks, months=months)
 
 def compute_slot_performance(days=1, end_date=None):
     end_date = normalize_date_str(end_date, fallback_today=True)

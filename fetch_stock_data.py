@@ -6,11 +6,11 @@ import os
 import collections
 import math
 
-# 人福医药的股票代码 (上交所)
-STOCK_CODE = 'sh600079'
+# 宝色股份的股票代码 (深交所创业板)
+STOCK_CODE = 'sz300402'
 SINA_API_URL = f'http://hq.sinajs.cn/list={STOCK_CODE}'
 HEADERS = {'Referer': 'http://finance.sina.com.cn'}
-CSV_FILENAME = 'renfu_stock_data.csv'
+CSV_FILENAME = 'baose_stock_data.csv'
 
 class DayTradeAnalyzer:
     def __init__(self, window_size=20):
@@ -103,7 +103,7 @@ def init_csv():
 
 def main():
     print("========================================")
-    print(" 🚀 人福医药 (600079) 日内做T动态监控系统")
+    print(" 🚀 宝色股份 (300402) 日内做T动态监控系统")
     print("========================================")
     print("原理：基于当日VWAP真实平均成本，叠加短线价格瞬时背离率进行高抛低吸提醒。")
     print("按 Ctrl+C 随时停止。\n")

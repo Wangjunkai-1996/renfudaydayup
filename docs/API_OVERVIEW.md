@@ -25,7 +25,7 @@ This project now groups Flask routes by responsibility to keep `app.py` smaller 
 
 - `date`: Optional exact date (`YYYY-MM-DD`).
 - `days`: Optional lookback days when `date` is not set. Range is clamped to `1..365`.
-- `code`: Optional stock code filter. Example: `sh600079`.
+- `code`: Optional stock code filter. Example: `sz300402`.
 - `status`: Optional filter. Allowed values: `pending`, `success`, `fail`.
 - `limit`: Optional max signal rows returned. Range is clamped to `1..5000`.
 

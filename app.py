@@ -55,14 +55,32 @@ def _env_bool(name, default='0'):
     return str(os.getenv(name, default)).strip().lower() in ('1', 'true', 'yes', 'on')
 
 HEADERS = {'Referer': 'http://finance.sina.com.cn'}
-FOCUS_STOCK_CODE = str(os.getenv('FOCUS_STOCK_CODE', 'sh600079')).strip().lower() or 'sh600079'
+DEFAULT_FOCUS_STOCK_CODE = 'sz300402'
+FOCUS_STOCK_NAME_MAP = {
+    'sz300402': '宝色股份',
+    'sh600079': '人福医药'
+}
+FOCUS_STOCK_CODE = str(os.getenv('FOCUS_STOCK_CODE', DEFAULT_FOCUS_STOCK_CODE)).strip().lower() or DEFAULT_FOCUS_STOCK_CODE
+FOCUS_STOCK_NAME = FOCUS_STOCK_NAME_MAP.get(FOCUS_STOCK_CODE, '焦点标的')
+
+# 个股相关的题材/板块抓取与标签规则（避免在逻辑里硬编码单一股票）。
+STOCK_CONTEXT_RULES = {
+    'sh600079': {
+        'board_name': '💊芬太尼板块',
+        'ths_board_url': 'http://q.10jqka.com.cn/gn/detail/code/308438/',
+        'ths_board_encoding': 'gbk',
+        'ths_board_regex': r'<p class="board-zdf">.*?&nbsp;&nbsp;&nbsp;&nbsp;(.*?)%</p>',
+        'force_concepts': ['芬太尼'],
+        'hot_keywords': ['芬太尼']
+    }
+}
 SINGLE_STOCK_MODE = _env_bool('RENFU_SINGLE_STOCK_MODE', '1')
 MAX_STOCKS = 1 if SINGLE_STOCK_MODE else 3
 MARKET_CLOSE_MINUTE = 15 * 60
 PRE_CLOSE_FLATTEN_MINUTE = 14 * 60 + 57
 PRE_CLOSE_WARN_MINUTE = 14 * 60 + 50
 PAPER_START_CASH = 800000.0
-DEFAULT_WATCHLIST = [FOCUS_STOCK_CODE] if SINGLE_STOCK_MODE else ['sh600079', 'sh688563']
+DEFAULT_WATCHLIST = [FOCUS_STOCK_CODE] if SINGLE_STOCK_MODE else [FOCUS_STOCK_CODE, 'sh688563']
 API_AUTH_TOKEN = str(os.getenv('API_AUTH_TOKEN', '')).strip()
 API_WRITE_METHODS = {'POST', 'PUT', 'PATCH', 'DELETE'}
 TRADE_CAL_REFRESH_SEC = 6 * 60 * 60
@@ -90,8 +108,27 @@ DEFAULT_SIGNAL_PROFILE = {
     'open_range_break_pct': 0.0045
 }
 
-# 人福医药(sh600079)做T专用参数：更强调“高质量、低频”。
+# 个股做T参数模板（可按股票波动特征独立调优）。
 STOCK_SIGNAL_PROFILES = {
+    # 宝色股份(sz300402)：创业板波动较大，适当放宽触发门槛并缩短同向锁定。
+    'sz300402': {
+        'name': 'baose_intraday_t_v1',
+        'min_points': 10,
+        'min_intraday_range': 0.0050,
+        'vwap_extreme_dev': 0.0110,
+        'vwap_bias_dev': 0.0055,
+        'obi_strong': 0.30,
+        'vol_spike_ratio': 1.6,
+        'signal_threshold': 0.53,
+        'edge_min': 0.12,
+        'same_dir_lock_sec': 1500,
+        'same_dir_price_step': 0.009,
+        'reverse_lock_sec': 1200,
+        'reverse_min_move': 0.009,
+        'gap_reversal_weight': 0.14,
+        'open_range_break_pct': 0.0060
+    },
+    # 人福医药(sh600079)：历史版本，偏低频高置信。
     'sh600079': {
         'name': 'renfu_intraday_t_v1',
         'min_points': 12,
@@ -148,14 +185,34 @@ STRATEGY_INT_KEYS = (
     'paper_min_lot'
 )
 
-DEFAULT_TIME_SLOT_TEMPLATES = {
-    # 人福医药单票做T模板：宁可少做，优先高置信信号。
-    'open': {'buy_min_score': 0.66, 'sell_min_score': 0.60, 'win_threshold': 0.010, 'loss_threshold': 0.0065},
-    'morning': {'buy_min_score': 0.61, 'sell_min_score': 0.57},
-    'afternoon_open': {'buy_min_score': 0.62, 'sell_min_score': 0.58},
-    'afternoon': {'buy_min_score': 0.60, 'sell_min_score': 0.56},
-    'close': {'buy_min_score': 0.66, 'sell_min_score': 0.60, 'loss_threshold': 0.0065}
+TIME_SLOT_TEMPLATES_BY_CODE = {
+    # 宝色股份：开收盘仍偏保守，盘中适当放宽以提升有效触发率。
+    'sz300402': {
+        'open': {'buy_min_score': 0.62, 'sell_min_score': 0.59, 'win_threshold': 0.0110, 'loss_threshold': 0.0075},
+        'morning': {'buy_min_score': 0.58, 'sell_min_score': 0.55},
+        'afternoon_open': {'buy_min_score': 0.59, 'sell_min_score': 0.56},
+        'afternoon': {'buy_min_score': 0.57, 'sell_min_score': 0.54},
+        'close': {'buy_min_score': 0.63, 'sell_min_score': 0.60, 'loss_threshold': 0.0078}
+    },
+    # 人福医药：历史模板，强调低频高置信。
+    'sh600079': {
+        'open': {'buy_min_score': 0.66, 'sell_min_score': 0.60, 'win_threshold': 0.010, 'loss_threshold': 0.0065},
+        'morning': {'buy_min_score': 0.61, 'sell_min_score': 0.57},
+        'afternoon_open': {'buy_min_score': 0.62, 'sell_min_score': 0.58},
+        'afternoon': {'buy_min_score': 0.60, 'sell_min_score': 0.56},
+        'close': {'buy_min_score': 0.66, 'sell_min_score': 0.60, 'loss_threshold': 0.0065}
+    }
 }
+DEFAULT_TIME_SLOT_TEMPLATES = copy.deepcopy(
+    TIME_SLOT_TEMPLATES_BY_CODE.get(FOCUS_STOCK_CODE, TIME_SLOT_TEMPLATES_BY_CODE[DEFAULT_FOCUS_STOCK_CODE])
+)
+
+_DEFAULT_OPEN_SLOT = DEFAULT_TIME_SLOT_TEMPLATES.get('open', {}) if isinstance(DEFAULT_TIME_SLOT_TEMPLATES, dict) else {}
+_DEFAULT_MORNING_SLOT = DEFAULT_TIME_SLOT_TEMPLATES.get('morning', {}) if isinstance(DEFAULT_TIME_SLOT_TEMPLATES, dict) else {}
+DEFAULT_WIN_THRESHOLD = float(_DEFAULT_OPEN_SLOT.get('win_threshold', 0.010) or 0.010)
+DEFAULT_LOSS_THRESHOLD = float(_DEFAULT_OPEN_SLOT.get('loss_threshold', 0.008) or 0.008)
+DEFAULT_BUY_MIN_SCORE = float(_DEFAULT_MORNING_SLOT.get('buy_min_score', _DEFAULT_OPEN_SLOT.get('buy_min_score', 0.58)) or 0.58)
+DEFAULT_SELL_MIN_SCORE = float(_DEFAULT_MORNING_SLOT.get('sell_min_score', _DEFAULT_OPEN_SLOT.get('sell_min_score', 0.55)) or 0.55)
 
 UNIT_INTERVAL_FLOAT_KEYS = {
     'win_threshold', 'loss_threshold',
@@ -656,16 +713,16 @@ init_db()
 rebuild_daily_stats()
 
 # === 全局状态 =========================
-active_stocks = {}  # {'sh600079': '人福医药'}
-market_data = {}    # {'sh600079': [{time, price, vwap}...]}
-analyzers = {}      # {'sh600079': DayTradeAnalyzer()}
+active_stocks = {}  # {'sz300402': '宝色股份'}
+market_data = {}    # {'sz300402': [{time, price, vwap}...]}
+analyzers = {}      # {'sz300402': DayTradeAnalyzer()}
 signals_history = []# 所有股票的信号流
 pending_signals = []# 正在等待出止盈/止损的信号
 success_rates = {
     'total': 0, 'success': 0, 'fail': 0, 'flat': 0, 'pending': 0,
-    'win_threshold': 0.009, 'loss_threshold': 0.0068,
+    'win_threshold': DEFAULT_WIN_THRESHOLD, 'loss_threshold': DEFAULT_LOSS_THRESHOLD,
     # BUY/SELL 分离过滤参数（默认对 BUY 更严格）
-    'buy_min_score': 0.61, 'sell_min_score': 0.57,
+    'buy_min_score': DEFAULT_BUY_MIN_SCORE, 'sell_min_score': DEFAULT_SELL_MIN_SCORE,
     'buy_require_confirmation': True, 'buy_reject_bearish_tape': True,
     # BUY 自动降噪：近 N 笔胜率过低则临时暂停 BUY
     'buy_auto_pause': True, 'buy_pause_window': 20,
@@ -696,14 +753,14 @@ success_rates = {
     'paper_commission_rate': 0.0003,
     'paper_sell_stamp_tax': 0.001,
     'paper_min_lot': 100,
-    # 仅在高质量策略窗口开仓，目标胜率保守设为 75%
+    # 仅在高质量策略窗口开仓，默认目标胜率设为 62%
     'regime_filter_enabled': True,
-    'regime_target_wr': 0.75,
-    'regime_lookback_days': 10,
-    'regime_min_samples': 20,
-    'regime_slot_min_samples': 5,
+    'regime_target_wr': 0.62,
+    'regime_lookback_days': 7,
+    'regime_min_samples': 10,
+    'regime_slot_min_samples': 3,
     'regime_require_trend_alignment': True,
-    'regime_block_open_close': True,
+    'regime_block_open_close': False,
     # 调试日志开关（结构化 JSONL）
     'debug_log_enabled': True,
     # 收盘后自动生成日报
@@ -812,9 +869,9 @@ def build_pre_close_alert_snapshot(pending_list, current_state, now=None):
 
         # 若动态止盈止损尚未初始化，则用策略默认阈值兜底。
         if entry_price > 0 and (win_price <= 0 or stop_price <= 0):
-            with state_lock:
-                win_threshold = float(success_rates.get('win_threshold', 0.010))
-                loss_threshold = float(success_rates.get('loss_threshold', 0.008))
+            strategy = get_effective_strategy(sig.get('time'), code=code)
+            win_threshold = float(strategy.get('win_threshold', DEFAULT_WIN_THRESHOLD))
+            loss_threshold = float(strategy.get('loss_threshold', DEFAULT_LOSS_THRESHOLD))
             if sig_type == 'BUY':
                 win_price = entry_price * (1 + win_threshold)
                 stop_price = entry_price * (1 - loss_threshold)
@@ -1675,22 +1732,60 @@ def get_time_slot_label(time_str=None):
         return 'close'
     return 'off_hours'
 
-def get_effective_strategy(time_str=None):
+def get_time_slot_templates_for_code(code=None):
+    c = str(code or '').strip().lower()
+    if c and c in TIME_SLOT_TEMPLATES_BY_CODE:
+        tpl = TIME_SLOT_TEMPLATES_BY_CODE.get(c, {})
+        return tpl if isinstance(tpl, dict) else {}
+    with state_lock:
+        tpl = success_rates.get('time_slot_templates', {})
+    return tpl if isinstance(tpl, dict) else {}
+
+def derive_baseline_strategy_from_templates(templates):
+    """从时段模板推导该股票的基础阈值（用于覆盖全局默认）。"""
+    if not isinstance(templates, dict):
+        return {}
+
+    open_cfg = templates.get('open', {}) if isinstance(templates.get('open', {}), dict) else {}
+    morning_cfg = templates.get('morning', {}) if isinstance(templates.get('morning', {}), dict) else {}
+
+    base = {}
+    if 'win_threshold' in open_cfg:
+        base['win_threshold'] = float(open_cfg.get('win_threshold') or DEFAULT_WIN_THRESHOLD)
+    if 'loss_threshold' in open_cfg:
+        base['loss_threshold'] = float(open_cfg.get('loss_threshold') or DEFAULT_LOSS_THRESHOLD)
+
+    buy_min = morning_cfg.get('buy_min_score', open_cfg.get('buy_min_score'))
+    sell_min = morning_cfg.get('sell_min_score', open_cfg.get('sell_min_score'))
+    if buy_min is not None:
+        base['buy_min_score'] = float(buy_min)
+    if sell_min is not None:
+        base['sell_min_score'] = float(sell_min)
+    return base
+
+def get_effective_strategy(time_str=None, code=None):
     """
     读取当前生效策略：
     - 先拿全局参数
     - 若开启 time_slot_enabled，则叠加对应时段模板
     """
     slot = get_time_slot_label(time_str)
+    templates = get_time_slot_templates_for_code(code)
+    baseline = derive_baseline_strategy_from_templates(templates)
+
     with state_lock:
         effective = {k: success_rates.get(k) for k in (STRATEGY_FLOAT_KEYS + STRATEGY_INT_KEYS + STRATEGY_BOOL_KEYS)}
-        effective['slot'] = slot
-        if effective.get('time_slot_enabled') and slot != 'off_hours':
-            templates = success_rates.get('time_slot_templates', {})
-            override = templates.get(slot, {}) if isinstance(templates, dict) else {}
-            if isinstance(override, dict):
-                for k, v in override.items():
-                    effective[k] = v
+
+    # 个股基线覆盖全局默认（比如 win/loss/buy/sell 阈值）。
+    for k, v in baseline.items():
+        effective[k] = v
+
+    effective['slot'] = slot
+    if effective.get('time_slot_enabled') and slot != 'off_hours':
+        override = templates.get(slot, {}) if isinstance(templates, dict) else {}
+        if isinstance(override, dict):
+            for k, v in override.items():
+                effective[k] = v
     return effective
 
 def reset_risk_state_for_day(day_str):
@@ -1739,7 +1834,7 @@ def maybe_trigger_risk_pause(reason, context=None):
 def update_risk_state_on_resolution(sig, final_status):
     now = datetime.datetime.now()
     today = now.strftime('%Y-%m-%d')
-    strategy = get_effective_strategy(sig.get('time'))
+    strategy = get_effective_strategy(sig.get('time'), code=sig.get('code'))
     if not strategy.get('risk_guard_enabled', True):
         return
 
@@ -2056,7 +2151,7 @@ def should_accept_signal(code, sig):
     factors = sig.get('factors') or []
     reasons = []
     signal_time = sig.get('time')
-    effective = get_effective_strategy(signal_time)
+    effective = get_effective_strategy(signal_time, code=code)
     buy_min_score = float(effective.get('buy_min_score', 0.58))
     sell_min_score = float(effective.get('sell_min_score', 0.55))
     buy_require_confirmation = bool(effective.get('buy_require_confirmation', True))
@@ -2235,6 +2330,8 @@ def fetch_stock_context_bg(code):
     context = {'trend': '数据加载中', 'industry': '未知', 'news': []}
     with state_lock:
         stock_contexts[code] = context  # setup initial
+
+    rules = STOCK_CONTEXT_RULES.get(str(code or '').lower(), {})
     
     # 1. 行业数据 (使用东财 f10 基本资料)
     industry_name = "未知"
@@ -2258,14 +2355,22 @@ def fetch_stock_context_bg(code):
     
     # 获取板块涨跌情况 (同花顺定制 or 新浪默认)
     try:
-        if code == 'sh600079':
-            target_name = "💊芬太尼板块"
+        target_pct = None
+        target_name = industry_name
+
+        ths_url = rules.get('ths_board_url') if isinstance(rules, dict) else None
+        if ths_url:
+            target_name = str(rules.get('board_name') or industry_name)
             try:
                 import urllib.request
-                import re
-                req = urllib.request.Request('http://q.10jqka.com.cn/gn/detail/code/308438/', headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
-                ths_html = urllib.request.urlopen(req, timeout=3).read().decode('gbk').replace('\n', '')
-                match = re.search(r'<p class=\"board-zdf\">.*?&nbsp;&nbsp;&nbsp;&nbsp;(.*?)%</p>', ths_html)
+                req = urllib.request.Request(
+                    ths_url,
+                    headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                )
+                enc = str(rules.get('ths_board_encoding') or 'gbk')
+                regex = str(rules.get('ths_board_regex') or '')
+                ths_html = urllib.request.urlopen(req, timeout=3).read().decode(enc).replace('\n', '')
+                match = re.search(regex, ths_html) if regex else None
                 if match:
                     target_pct = float(match.group(1))
                 else:
@@ -2274,13 +2379,11 @@ def fetch_stock_context_bg(code):
                 print(f"fetch ths error: {e}")
                 target_pct = 0.0
         else:
-            target_pct = None
-            target_name = industry_name
             hy_resp = requests.get("http://vip.stock.finance.sina.com.cn/q/view/newSinaHy.php", timeout=3)
             hy_resp.encoding = 'gbk'
             import json
             hy_data = json.loads(hy_resp.text.split('=', 1)[1].strip(' ;'))
-            
+
             # 使用更宽泛的容错兜底来尝试匹配。如果完全未匹配上，就保持现状。
             for val in hy_data.values():
                 parts = val.split(',')
@@ -2302,9 +2405,17 @@ def fetch_stock_context_bg(code):
             
         # 追加关键概念标
         if concepts:
-            if code == 'sh600079' and '芬太尼' not in concepts:
-                concepts += ',芬太尼'
-            hot_keywords = ['芬太尼']
+            forced = []
+            if isinstance(rules, dict):
+                forced = list(rules.get('force_concepts') or [])
+            for kw in forced:
+                kw = str(kw or '').strip()
+                if kw and kw not in concepts:
+                    concepts += f",{kw}"
+
+            hot_keywords = []
+            if isinstance(rules, dict):
+                hot_keywords = list(rules.get('hot_keywords') or [])
             matched_concepts = [k for k in hot_keywords if k in concepts]
             if matched_concepts:
                 concept_tags = "".join([f"<span class='bg-purple-600/30 text-purple-300 border border-purple-500/50 text-[10px] px-2 py-0.5 rounded-full ml-1 font-bold'>⭐{k}⭐</span>" for k in matched_concepts])
@@ -2686,7 +2797,7 @@ class DayTradeAnalyzer:
                             bear_score += 0.15
                             factors.append(f"放量杀跌{vol_ratio:.1f}x")
 
-        # ── 因子4.5: 人福医药增强因子（低开修复/高开回落 + 开盘区间过冲） ──
+        # ── 因子4.5: 高波动股增强因子（低开修复/高开回落 + 开盘区间过冲） ──
         if gap_reversal_weight > 0 and open_price > 0 and yest_close > 0:
             gap_pct = (open_price - yest_close) / yest_close
             if gap_pct <= -0.008 and current_price >= open_price:
@@ -2970,7 +3081,7 @@ def restore_watchlist_on_startup():
         # 单票模式仅恢复焦点票，避免旧watchlist把多票重新拉起。
         focus = FOCUS_STOCK_CODE
         if focus not in watch_codes:
-            upsert_watchlist_entry(focus, '人福医药')
+            upsert_watchlist_entry(focus, FOCUS_STOCK_NAME)
             watch_codes = [focus]
         else:
             watch_codes = [focus]
@@ -3204,14 +3315,15 @@ def fetch_worker():
                 db_updates = []
                 debug_events = []
                 with state_lock:
-                    win_threshold = success_rates.get('win_threshold', 0.015)
-                    loss_threshold = success_rates.get('loss_threshold', 0.008)
-
                     for sig in pending_signals[:]:
                         code = sig['code']
                         if code not in current_prices:
                             continue
                         cp = current_prices[code]
+
+                        strategy = get_effective_strategy(sig.get('time'), code=code)
+                        win_threshold = float(strategy.get('win_threshold', DEFAULT_WIN_THRESHOLD))
+                        loss_threshold = float(strategy.get('loss_threshold', DEFAULT_LOSS_THRESHOLD))
 
                         # 初始化动态止损价和止盈价
                         if 'stop_price' not in sig:
@@ -4432,9 +4544,9 @@ if __name__ == '__main__':
         print("⚠️ WebSocket 未启用 (未安装 flask-sock)，前端将回退为轮询模式")
     
     if SINGLE_STOCK_MODE:
-        print(f"🚀 启动人福医药单票做T专用版 Web 端 (focus={FOCUS_STOCK_CODE})...")
+        print(f"🚀 启动{FOCUS_STOCK_NAME}单票做T专用版 Web 端 (focus={FOCUS_STOCK_CODE})...")
     else:
-        print("🚀 启动人福医药量化策略多只自选版 Web 端...")
+        print("🚀 启动量化策略多只自选版 Web 端...")
     t = threading.Thread(target=fetch_worker, daemon=True)
     t.start()
     port = int(os.getenv('PORT', 8080))

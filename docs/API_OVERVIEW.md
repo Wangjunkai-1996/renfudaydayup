@@ -19,6 +19,7 @@ This project now groups Flask routes by responsibility to keep `app.py` smaller 
   - `/api/reports/daily*`
   - `/api/preflight`
   - `/api/analytics/slot-performance`
+  - `/api/analytics/edge-diagnostics`
   - `/api/tuning/*`
   - `/api/signals/<sig_id>/explain`
 
@@ -39,6 +40,7 @@ Validation behavior:
 - Existing payload fields for `/api/history` are kept (`signals`, `daily_stats`, `date_stats`) and now include `success` and `query` metadata.
 - `/api/config` now supports `stock_strategies` nested patches, so each stock can carry its own `time_slot_templates` and `signal_profile` plus per-stock threshold overrides.
 - `/api/notify/test` can be used to verify Server酱 delivery after `SERVERCHAN_SENDKEY` is configured.
+- `/api/analytics/edge-diagnostics` returns stock + direction + slot diagnostics for recent samples and gives a focused patch preview for the main stock.
 - Shared helper modules:
   - `renfu/request_args.py` for query parsing (`int` clamp and `since_ts` parse).
   - `renfu/history_service.py` for history SQL assembly and payload shape.

@@ -25,6 +25,7 @@ def register_report_routes(
     compare_reports,
     build_preflight_assessment,
     compute_slot_performance,
+    compute_edge_diagnostics,
     build_slot_hints,
     build_param_suggestion,
     save_tuning_suggestion,
@@ -198,6 +199,14 @@ def register_report_routes(
         perf = compute_slot_performance(days=days, end_date=end_date)
         hints = build_slot_hints(perf)
         return jsonify({'success': True, 'performance': perf, 'hints': hints})
+
+    @bp.route('/api/analytics/edge-diagnostics')
+    def api_edge_diagnostics_route():
+        days = parse_int_value(request.args.get('days', 15), 15, min_value=1, max_value=120)
+        end_date = request.args.get('date')
+        focus_code = request.args.get('focus')
+        diagnostics = compute_edge_diagnostics(days=days, end_date=end_date, focus_code=focus_code)
+        return jsonify({'success': True, 'diagnostics': diagnostics})
 
     @bp.route('/api/tuning/suggest')
     def api_tuning_suggest_route():

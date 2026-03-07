@@ -33,6 +33,8 @@ def test_default_focus_stock_and_limit(load_app):
     assert app_module.FOCUS_STOCK_NAME == '江苏神通'
     assert app_module.MAX_STOCKS == 3
     assert app_module.DEFAULT_WATCHLIST == ['sz002438']
+    assert app_module.get_stock_signal_profile('sz002438')['name'] == 'jsst_intraday_t_v1'
+    assert app_module.get_time_slot_templates_for_code('sz002438')['open']['buy_min_score'] == 0.64
 
 
 def test_apply_add_stock_rejects_when_already_at_three(load_app):
@@ -366,3 +368,38 @@ def test_notify_test_endpoint_dispatches_via_hub(load_app):
     payload = resp.get_json()
     assert payload['success'] is True
     assert calls == [{'title': '连通性测试', 'body': 'ok'}]
+
+
+def test_edge_diagnostics_endpoint_returns_focus_patch(load_app):
+    app_module = load_app()
+    conn = app_module.get_db()
+    rows = [
+        ('a1', '2026-03-07', '09:35:00', 1, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.8),
+        ('a2', '2026-03-07', '09:48:00', 2, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.5),
+        ('a3', '2026-03-07', '10:12:00', 3, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'success', 0.6),
+        ('a4', '2026-03-07', '13:08:00', 4, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.4),
+        ('a5', '2026-03-07', '13:42:00', 5, 'sz002438', '江苏神通', 'SELL', 1, 10.0, 'd', 'success', 0.7),
+        ('a6', '2026-03-07', '14:36:00', 6, 'sz002438', '江苏神通', 'SELL', 1, 10.0, 'd', 'success', 0.5),
+    ]
+    conn.executemany(
+        """
+        INSERT INTO signals (id, date, time, seq_no, code, name, type, level, price, desc, status, profit_pct)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows
+    )
+    conn.commit()
+    conn.close()
+
+    client = app_module.app.test_client()
+    resp = client.get('/api/analytics/edge-diagnostics?days=10&focus=sz002438&date=2026-03-07')
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload['success'] is True
+    diagnostics = payload['diagnostics']
+    assert diagnostics['focus']['code'] == 'sz002438'
+    assert diagnostics['focus_strategy']['profile_name'] == 'jsst_intraday_t_v1'
+    patch = diagnostics['proposed_patch']['stock_strategies']['sz002438']
+    assert patch['buy_min_score'] > 0.6
+    assert patch['signal_profile']['signal_threshold'] >= 0.6

@@ -32,6 +32,7 @@ except ImportError:
 from renfu.api_auth import verify_request_token
 from renfu.date_utils import normalize_date_str
 from renfu.debug_summary import summarize_debug_entries
+from renfu.edge_diagnostics import build_edge_diagnostics as build_edge_diagnostics_payload
 from renfu.market_provider import MarketQuoteManager
 from renfu.notifications import NotificationHub
 from renfu.periodic_report_service import build_periodic_report as build_periodic_report_data
@@ -148,6 +149,23 @@ STOCK_SIGNAL_PROFILES = {
         'reverse_min_move': 0.012,
         'gap_reversal_weight': 0.12,
         'open_range_break_pct': 0.0035
+    },
+    'sz002438': {
+        'name': 'jsst_intraday_t_v1',
+        'min_points': 11,
+        'min_intraday_range': 0.0048,
+        'vwap_extreme_dev': 0.0095,
+        'vwap_bias_dev': 0.0048,
+        'obi_strong': 0.36,
+        'vol_spike_ratio': 1.9,
+        'signal_threshold': 0.58,
+        'edge_min': 0.17,
+        'same_dir_lock_sec': 2100,
+        'same_dir_price_step': 0.011,
+        'reverse_lock_sec': 2100,
+        'reverse_min_move': 0.011,
+        'gap_reversal_weight': 0.11,
+        'open_range_break_pct': 0.0042
     }
 }
 
@@ -204,6 +222,13 @@ TIME_SLOT_TEMPLATES_BY_CODE = {
         'afternoon_open': {'buy_min_score': 0.62, 'sell_min_score': 0.58},
         'afternoon': {'buy_min_score': 0.60, 'sell_min_score': 0.56},
         'close': {'buy_min_score': 0.66, 'sell_min_score': 0.60, 'loss_threshold': 0.0065}
+    },
+    'sz002438': {
+        'open': {'buy_min_score': 0.64, 'sell_min_score': 0.60, 'win_threshold': 0.0105, 'loss_threshold': 0.0068},
+        'morning': {'buy_min_score': 0.60, 'sell_min_score': 0.56},
+        'afternoon_open': {'buy_min_score': 0.61, 'sell_min_score': 0.57},
+        'afternoon': {'buy_min_score': 0.59, 'sell_min_score': 0.55},
+        'close': {'buy_min_score': 0.64, 'sell_min_score': 0.60, 'loss_threshold': 0.0068}
     }
 }
 DEFAULT_TIME_SLOT_TEMPLATES = copy.deepcopy(
@@ -4097,6 +4122,156 @@ def compute_slot_performance(days=1, end_date=None):
         'items': slot_items
     }
 
+DIAG_SLOT_LABELS = {
+    'open': '开盘段',
+    'morning': '上午盘',
+    'afternoon_open': '午后开盘',
+    'afternoon': '午后盘',
+    'close': '尾盘',
+    'off_hours': '非交易时段'
+}
+
+
+def build_focus_patch_from_diagnostics(focus_item, code=None):
+    c = str(code or FOCUS_STOCK_CODE).strip().lower() or FOCUS_STOCK_CODE
+    if not focus_item or str(focus_item.get('code') or '').strip().lower() != c:
+        return {}, []
+
+    current_templates = get_time_slot_templates_for_code(c)
+    current_profile = get_stock_signal_profile(c)
+    baseline_strategy = derive_baseline_strategy_from_templates(current_templates)
+    current_strategy = get_effective_strategy(code=c)
+
+    current_buy = float(baseline_strategy.get('buy_min_score', current_strategy.get('buy_min_score', DEFAULT_BUY_MIN_SCORE)) or DEFAULT_BUY_MIN_SCORE)
+    current_sell = float(baseline_strategy.get('sell_min_score', current_strategy.get('sell_min_score', DEFAULT_SELL_MIN_SCORE)) or DEFAULT_SELL_MIN_SCORE)
+
+    stock_patch = {}
+    patch_summary = []
+
+    def ensure_signal_profile_patch():
+        return stock_patch.setdefault('signal_profile', {})
+
+    def ensure_slot_patch(slot_name):
+        slot_templates = stock_patch.setdefault('time_slot_templates', {})
+        return slot_templates.setdefault(slot_name, {})
+
+    focus_buy = (focus_item.get('by_type') or {}).get('BUY', {})
+    focus_sell = (focus_item.get('by_type') or {}).get('SELL', {})
+
+    if int(focus_buy.get('completed', 0) or 0) >= 4 and float(focus_buy.get('win_rate', 0.0) or 0.0) < 45.0:
+        new_buy = min(0.84, current_buy + 0.02)
+        if new_buy > current_buy:
+            stock_patch['buy_min_score'] = round(new_buy, 4)
+            profile_patch = ensure_signal_profile_patch()
+            current_threshold = float(current_profile.get('signal_threshold', DEFAULT_SIGNAL_PROFILE.get('signal_threshold', 0.55)) or 0.55)
+            current_edge = float(current_profile.get('edge_min', DEFAULT_SIGNAL_PROFILE.get('edge_min', 0.15)) or 0.15)
+            profile_patch['signal_threshold'] = round(min(0.72, current_threshold + 0.02), 4)
+            profile_patch['edge_min'] = round(min(0.24, current_edge + 0.01), 4)
+            patch_summary.append(f"{FOCUS_STOCK_NAME_MAP.get(c, c)} BUY 偏弱，建议 buy_min_score {current_buy:.2f}→{new_buy:.2f} 并提高信号阈值")
+
+    if int(focus_sell.get('completed', 0) or 0) >= 4 and float(focus_sell.get('win_rate', 0.0) or 0.0) < 45.0:
+        new_sell = min(0.82, current_sell + 0.02)
+        if new_sell > current_sell:
+            stock_patch['sell_min_score'] = round(new_sell, 4)
+            patch_summary.append(f"{FOCUS_STOCK_NAME_MAP.get(c, c)} SELL 偏弱，建议 sell_min_score {current_sell:.2f}→{new_sell:.2f}")
+
+    worst_slot = focus_item.get('worst_slot') or {}
+    worst_slot_name = str(worst_slot.get('slot') or '')
+    if worst_slot_name and int(worst_slot.get('completed', 0) or 0) >= 3 and float(worst_slot.get('win_rate', 0.0) or 0.0) < 40.0:
+        slot_by_type = worst_slot.get('by_type') or {}
+        slot_buy = slot_by_type.get('BUY', {})
+        slot_sell = slot_by_type.get('SELL', {})
+        weaker_side = ''
+        if int(slot_buy.get('completed', 0) or 0) >= 2 and float(slot_buy.get('win_rate', 0.0) or 0.0) < 45.0:
+            weaker_side = 'BUY'
+        if int(slot_sell.get('completed', 0) or 0) >= 2 and float(slot_sell.get('win_rate', 0.0) or 0.0) < float(slot_buy.get('win_rate', 999.0) or 999.0):
+            weaker_side = 'SELL'
+
+        current_slot_cfg = current_templates.get(worst_slot_name, {}) if isinstance(current_templates, dict) else {}
+        if weaker_side == 'BUY':
+            slot_buy_now = float(current_slot_cfg.get('buy_min_score', current_buy) or current_buy)
+            slot_buy_new = min(0.86, slot_buy_now + 0.02)
+            if slot_buy_new > slot_buy_now:
+                ensure_slot_patch(worst_slot_name)['buy_min_score'] = round(slot_buy_new, 4)
+                patch_summary.append(f"{DIAG_SLOT_LABELS.get(worst_slot_name, worst_slot_name)} BUY 最弱，建议 buy_min_score {slot_buy_now:.2f}→{slot_buy_new:.2f}")
+        elif weaker_side == 'SELL':
+            slot_sell_now = float(current_slot_cfg.get('sell_min_score', current_sell) or current_sell)
+            slot_sell_new = min(0.84, slot_sell_now + 0.02)
+            if slot_sell_new > slot_sell_now:
+                ensure_slot_patch(worst_slot_name)['sell_min_score'] = round(slot_sell_new, 4)
+                patch_summary.append(f"{DIAG_SLOT_LABELS.get(worst_slot_name, worst_slot_name)} SELL 最弱，建议 sell_min_score {slot_sell_now:.2f}→{slot_sell_new:.2f}")
+
+    if int(focus_item.get('completed', 0) or 0) >= 8 and float(focus_item.get('avg_profit_pct', 0.0) or 0.0) < 0.0:
+        profile_patch = ensure_signal_profile_patch()
+        current_range = float(current_profile.get('min_intraday_range', DEFAULT_SIGNAL_PROFILE.get('min_intraday_range', 0.004)) or 0.004)
+        new_range = min(0.0100, current_range + 0.0005)
+        if new_range > current_range:
+            profile_patch['min_intraday_range'] = round(new_range, 4)
+            patch_summary.append(f"已完成样本均笔收益为负，建议提高最小波动门槛 {current_range:.4f}→{new_range:.4f}")
+
+    if 'signal_profile' in stock_patch and not stock_patch['signal_profile']:
+        stock_patch.pop('signal_profile', None)
+    if 'time_slot_templates' in stock_patch and not stock_patch['time_slot_templates']:
+        stock_patch.pop('time_slot_templates', None)
+
+    if not stock_patch:
+        return {}, []
+    return {'stock_strategies': {c: stock_patch}}, patch_summary
+
+
+def compute_edge_diagnostics(days=15, end_date=None, focus_code=None):
+    end_date = normalize_date_str(end_date, fallback_today=True)
+    if not end_date:
+        end_date = datetime.datetime.now().strftime('%Y-%m-%d')
+    try:
+        end_dt = datetime.datetime.strptime(end_date, '%Y-%m-%d').date()
+    except Exception:
+        end_dt = datetime.datetime.now().date()
+    days = max(1, min(int(days), 120))
+    start_dt = end_dt - datetime.timedelta(days=days - 1)
+
+    focus = str(focus_code or FOCUS_STOCK_CODE).strip().lower() or FOCUS_STOCK_CODE
+    with state_lock:
+        focus_name = active_stocks.get(focus, '')
+    if not focus_name:
+        focus_name = FOCUS_STOCK_NAME_MAP.get(focus, FOCUS_STOCK_NAME if focus == FOCUS_STOCK_CODE else '')
+
+    rows = get_signal_rows(date_from=start_dt.strftime('%Y-%m-%d'), date_to=end_dt.strftime('%Y-%m-%d'))
+    diagnostics = build_edge_diagnostics_payload(rows, focus_code=focus, focus_name=focus_name)
+    diagnostics['date_range'] = {
+        'from': start_dt.strftime('%Y-%m-%d'),
+        'to': end_dt.strftime('%Y-%m-%d'),
+        'days': days
+    }
+
+    focus_templates = get_time_slot_templates_for_code(focus)
+    focus_base = derive_baseline_strategy_from_templates(focus_templates)
+    focus_profile = get_stock_signal_profile(focus)
+    current_strategy = get_effective_strategy(code=focus)
+    diagnostics['focus_strategy'] = {
+        'code': focus,
+        'name': focus_name or FOCUS_STOCK_NAME_MAP.get(focus, focus),
+        'profile_name': str(focus_profile.get('name') or ''),
+        'buy_min_score': round(float(focus_base.get('buy_min_score', current_strategy.get('buy_min_score', DEFAULT_BUY_MIN_SCORE)) or DEFAULT_BUY_MIN_SCORE), 4),
+        'sell_min_score': round(float(focus_base.get('sell_min_score', current_strategy.get('sell_min_score', DEFAULT_SELL_MIN_SCORE)) or DEFAULT_SELL_MIN_SCORE), 4),
+        'signal_threshold': round(float(focus_profile.get('signal_threshold', DEFAULT_SIGNAL_PROFILE.get('signal_threshold', 0.55)) or 0.55), 4),
+        'edge_min': round(float(focus_profile.get('edge_min', DEFAULT_SIGNAL_PROFILE.get('edge_min', 0.15)) or 0.15), 4)
+    }
+
+    proposed_patch, patch_summary = build_focus_patch_from_diagnostics(diagnostics.get('focus'), code=focus)
+    diagnostics['proposed_patch'] = proposed_patch
+    diagnostics['patch_summary'] = patch_summary
+
+    notes = []
+    if focus == 'sz002438':
+        notes.append('江苏神通已启用更偏保守的默认模板，优先提升净胜率与信号质量')
+    focus_item = diagnostics.get('focus') or {}
+    if int(focus_item.get('completed', 0) or 0) < 6:
+        notes.append('当前真实样本还偏少，建议先累计到 6-10 笔已完成样本后再做自动细调')
+    diagnostics['notes'] = notes
+    return diagnostics
+
+
 def build_slot_hints(slot_perf):
     hints = []
     for item in slot_perf.get('items', []):
@@ -4458,6 +4633,17 @@ def get_or_generate_daily_report(target_date, trigger='auto'):
         report, paths = generate_daily_report(target_date, trigger=trigger)
     return report, paths
 
+def _merge_patch_tree(target, incoming):
+    for key, value in (incoming or {}).items():
+        if isinstance(value, dict) and isinstance(target.get(key), dict):
+            _merge_patch_tree(target[key], value)
+        elif isinstance(value, dict):
+            target[key] = copy.deepcopy(value)
+        else:
+            target[key] = value
+    return target
+
+
 def build_param_suggestion(target_date, baseline_date=None):
     report, _ = get_or_generate_daily_report(target_date, trigger='suggestion')
     baseline_report = None
@@ -4514,6 +4700,12 @@ def build_param_suggestion(target_date, baseline_date=None):
             patch['buy_min_score'] = min(0.82, max(float(patch.get('buy_min_score', strategy.get('buy_min_score', 0.58))), float(strategy.get('buy_min_score', 0.58)) + 0.02))
             reasons.append(f"较基准日胜率下降 {abs(win_drop):.1f}pct，额外收紧 BUY 门槛")
 
+    diagnostics = compute_edge_diagnostics(days=max(7, min(20, int(strategy.get('regime_lookback_days', 7) or 7))), end_date=target_date, focus_code=FOCUS_STOCK_CODE)
+    diag_patch = diagnostics.get('proposed_patch', {}) if isinstance(diagnostics, dict) else {}
+    if isinstance(diag_patch, dict) and diag_patch:
+        patch = _merge_patch_tree(patch, diag_patch)
+        reasons.extend(diagnostics.get('patch_summary', []))
+
     # 没有明确建议时给出保持策略
     if not patch:
         reasons.append("当前样本下未发现明显参数漂移，建议保持现有参数并继续观察")
@@ -4531,7 +4723,8 @@ def build_param_suggestion(target_date, baseline_date=None):
             'sell_win_rate': sell_wr,
             'completed': completed
         },
-        'compare': compare
+        'compare': compare,
+        'diagnostics': diagnostics
     }
 
 def get_default_baseline_date(target_date):
@@ -4787,6 +4980,7 @@ register_report_routes(
     compare_reports=compare_reports,
     build_preflight_assessment=build_preflight_assessment,
     compute_slot_performance=compute_slot_performance,
+    compute_edge_diagnostics=compute_edge_diagnostics,
     build_slot_hints=build_slot_hints,
     build_param_suggestion=build_param_suggestion,
     save_tuning_suggestion=save_tuning_suggestion,

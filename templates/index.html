@@ -147,7 +147,7 @@
                 </div>
 
                 <!-- Strategy Panels -->
-                <div class="grid grid-cols-1 2xl:grid-cols-2 gap-4">
+                <div class="grid grid-cols-1 2xl:grid-cols-3 gap-4">
                     <div class="bg-slate-800/90 rounded-xl border border-slate-700 p-4 shadow-lg">
                         <div class="flex items-center justify-between mb-3">
                             <h3 class="text-sm font-semibold text-slate-200">实盘前体检</h3>
@@ -182,6 +182,38 @@
                             <div class="text-slate-500">数据加载中...</div>
                         </div>
                         <div id="slot-hints" class="mt-3 space-y-1 text-[11px]"></div>
+                    </div>
+
+                    <div class="bg-slate-800/90 rounded-xl border border-slate-700 p-4 shadow-lg">
+                        <div class="flex items-center justify-between mb-3">
+                            <h3 class="text-sm font-semibold text-slate-200">胜率诊断</h3>
+                            <span id="diag-range"
+                                class="text-[10px] px-2 py-1 rounded border border-slate-600 text-slate-400">--</span>
+                        </div>
+                        <div class="grid grid-cols-4 gap-2 mb-3 text-[11px]">
+                            <div class="bg-slate-900/70 rounded p-2 border border-slate-700/50">
+                                <div class="text-slate-500">聚焦标的</div>
+                                <div id="diag-focus" class="text-slate-200 font-bold mt-1">--</div>
+                            </div>
+                            <div class="bg-slate-900/70 rounded p-2 border border-slate-700/50">
+                                <div class="text-slate-500">已完成</div>
+                                <div id="diag-completed" class="text-slate-200 font-bold mt-1">--</div>
+                            </div>
+                            <div class="bg-slate-900/70 rounded p-2 border border-slate-700/50">
+                                <div class="text-slate-500">净胜率</div>
+                                <div id="diag-win-rate" class="text-slate-200 font-bold mt-1">--</div>
+                            </div>
+                            <div class="bg-slate-900/70 rounded p-2 border border-slate-700/50">
+                                <div class="text-slate-500">均笔收益</div>
+                                <div id="diag-avg-profit" class="text-slate-200 font-bold mt-1">--</div>
+                            </div>
+                        </div>
+                        <div id="diag-profile" class="text-[11px] text-slate-400 mb-2">数据加载中...</div>
+                        <div id="diag-stocks" class="space-y-1 text-[11px] text-slate-300">
+                            <div class="text-slate-500">数据加载中...</div>
+                        </div>
+                        <div id="diag-suggestions" class="mt-3 space-y-1 text-[11px]"></div>
+                        <div id="diag-patch" class="mt-3 space-y-1 text-[11px]"></div>
                     </div>
                 </div>
 
@@ -1260,6 +1292,77 @@
             }
         }
 
+
+        function renderEdgeDiagnostics(diagnostics) {
+            const rangeEl = document.getElementById('diag-range');
+            const focusEl = document.getElementById('diag-focus');
+            const completedEl = document.getElementById('diag-completed');
+            const winRateEl = document.getElementById('diag-win-rate');
+            const avgProfitEl = document.getElementById('diag-avg-profit');
+            const profileEl = document.getElementById('diag-profile');
+            const stocksEl = document.getElementById('diag-stocks');
+            const suggestionsEl = document.getElementById('diag-suggestions');
+            const patchEl = document.getElementById('diag-patch');
+            if (!rangeEl || !focusEl || !completedEl || !winRateEl || !avgProfitEl || !profileEl || !stocksEl || !suggestionsEl || !patchEl) return;
+
+            const range = (diagnostics || {}).date_range || {};
+            rangeEl.innerText = range.from && range.to ? `${range.from} ~ ${range.to}` : '--';
+
+            const focus = (diagnostics || {}).focus || {};
+            const focusStrategy = (diagnostics || {}).focus_strategy || {};
+            const focusName = focus.name || focusStrategy.name || '--';
+            const focusCode = focus.code || focusStrategy.code || '';
+            focusEl.innerText = focusCode ? `${focusName} ${focusCode}` : focusName;
+            completedEl.innerText = `${focus.completed ?? 0}`;
+            winRateEl.innerText = `${Number(focus.win_rate || 0).toFixed(1)}%`;
+            avgProfitEl.innerText = `${Number(focus.avg_profit_pct || 0).toFixed(3)}%`;
+
+            const profileName = focusStrategy.profile_name || '--';
+            profileEl.innerText = `画像 ${profileName} | BUY ${Number(focusStrategy.buy_min_score || 0).toFixed(2)} | SELL ${Number(focusStrategy.sell_min_score || 0).toFixed(2)} | 阈值 ${Number(focusStrategy.signal_threshold || 0).toFixed(2)}`;
+
+            const stockItems = (diagnostics || {}).stocks || [];
+            if (!stockItems.length) {
+                stocksEl.innerHTML = '<div class="text-slate-500">暂无真实成交样本</div>';
+            } else {
+                stocksEl.innerHTML = stockItems.slice(0, 3).map(item => {
+                    const wr = Number(item.win_rate || 0);
+                    const wrClass = wr >= 60 ? 'text-emerald-300' : (wr >= 45 ? 'text-amber-300' : 'text-rose-300');
+                    const buy = ((item.by_type || {}).BUY || {});
+                    const sell = ((item.by_type || {}).SELL || {});
+                    const worst = item.worst_slot || {};
+                    return `
+                        <div class="rounded border border-slate-700/50 bg-slate-900/60 px-2 py-1.5">
+                            <div class="flex items-center justify-between gap-2">
+                                <div class="text-slate-200">${escapeHtml(item.name || item.code || '--')} <span class="text-slate-500">${escapeHtml(item.code || '')}</span></div>
+                                <div class="font-mono ${wrClass}">${wr.toFixed(1)}%</div>
+                            </div>
+                            <div class="mt-1 text-slate-400">完成 ${item.completed || 0} · BUY ${Number(buy.win_rate || 0).toFixed(1)}% · SELL ${Number(sell.win_rate || 0).toFixed(1)}% · 均笔 ${Number(item.avg_profit_pct || 0).toFixed(3)}%</div>
+                            <div class="mt-1 text-slate-500">最弱: ${escapeHtml(worst.label || '--')} ${Number(worst.win_rate || 0).toFixed(1)}%</div>
+                        </div>`;
+                }).join('');
+            }
+
+            const notes = (diagnostics || {}).notes || [];
+            const suggestions = [...((diagnostics || {}).suggestions || []), ...notes.map(msg => ({ level: 'info', msg }))];
+            if (!suggestions.length) {
+                suggestionsEl.innerHTML = '<div class="text-slate-500">暂无明显诊断结论</div>';
+            } else {
+                suggestionsEl.innerHTML = suggestions.slice(0, 5).map(item => {
+                    const cls = item.level === 'warn'
+                        ? 'text-amber-300 border-amber-500/30 bg-amber-500/10'
+                        : 'text-slate-300 border-slate-600 bg-slate-700/20';
+                    return `<div class="px-2 py-1 rounded border ${cls}">${escapeHtml(item.msg || '')}</div>`;
+                }).join('');
+            }
+
+            const patchSummary = (diagnostics || {}).patch_summary || [];
+            if (!patchSummary.length) {
+                patchEl.innerHTML = '<div class="text-slate-500">当前暂无建议直接落地的调参动作</div>';
+            } else {
+                patchEl.innerHTML = patchSummary.slice(0, 4).map(line => `<div class="px-2 py-1 rounded border border-cyan-500/30 bg-cyan-500/10 text-cyan-200">${escapeHtml(line)}</div>`).join('');
+            }
+        }
+
         function renderPreCloseAlerts(preClose) {
             const panel = document.getElementById('preclose-alert-panel');
             const badge = document.getElementById('preclose-stage-badge');
@@ -1599,17 +1702,22 @@
             if (strategyPanelLoading) return;
             strategyPanelLoading = true;
             try {
-                const [pfRes, slotRes] = await Promise.all([
+                const [pfRes, slotRes, diagRes] = await Promise.all([
                     apiFetch('/api/preflight?lookback=7'),
-                    apiFetch('/api/analytics/slot-performance?days=10')
+                    apiFetch('/api/analytics/slot-performance?days=10'),
+                    apiFetch('/api/analytics/edge-diagnostics?days=15')
                 ]);
                 const pfData = await pfRes.json();
                 const slotData = await slotRes.json();
+                const diagData = await diagRes.json();
                 if (pfData && pfData.success) {
                     renderPreflight(pfData.assessment);
                 }
                 if (slotData && slotData.success) {
                     renderSlotPerformance(slotData.performance, slotData.hints || []);
+                }
+                if (diagData && diagData.success) {
+                    renderEdgeDiagnostics(diagData.diagnostics);
                 }
                 strategyPanelLastFetchTs = now;
             } catch (e) {

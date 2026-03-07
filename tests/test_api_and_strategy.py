@@ -1,4 +1,5 @@
 import datetime
+import os
 
 
 def _prime_market_state(app_module):
@@ -196,6 +197,378 @@ def test_should_accept_signal_blocks_open_slot_when_enabled(load_app):
     assert accepted is False
     assert 'risk_slot_block_open' in reasons
     assert meta.get('slot') == 'open'
+
+
+def test_focus_guard_blocks_weak_focus_buy_slot(load_app):
+    app_module = load_app()
+    conn = app_module.get_db()
+    rows = [
+        ('fg1', '2026-03-07', '10:02:00', 1, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.8),
+        ('fg2', '2026-03-07', '10:06:00', 2, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.5),
+        ('fg3', '2026-03-07', '10:10:00', 3, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.4),
+        ('fg4', '2026-03-07', '10:14:00', 4, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'success', 0.2),
+        ('fg5', '2026-03-07', '13:35:00', 5, 'sz002438', '江苏神通', 'SELL', 1, 10.0, 'd', 'success', 0.7),
+        ('fg6', '2026-03-07', '14:10:00', 6, 'sz002438', '江苏神通', 'SELL', 1, 10.0, 'd', 'success', 0.5),
+    ]
+    conn.executemany(
+        """
+        INSERT INTO signals (id, date, time, seq_no, code, name, type, level, price, desc, status, profit_pct)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows
+    )
+    conn.commit()
+    conn.close()
+
+    with app_module.state_lock:
+        app_module.success_rates['risk_block_open_slot'] = False
+        app_module.success_rates['risk_block_close_slot'] = False
+        app_module.success_rates['regime_filter_enabled'] = False
+        app_module.success_rates['buy_require_confirmation'] = False
+        app_module.success_rates['buy_reject_bearish_tape'] = False
+        app_module.success_rates['focus_guard_enabled'] = True
+
+    accepted, reasons, meta = app_module.should_accept_signal(
+        'sz002438',
+        {'type': 'BUY', 'date': '2026-03-07', 'time': '10:20:00', 'bull_score': 0.95, 'bear_score': 0.1, 'factors': []}
+    )
+
+    assert accepted is False
+    assert ('focus_guard_weak_side' in reasons) or ('focus_guard_weak_slot' in reasons) or ('focus_guard_weak_slot_side' in reasons)
+    assert meta.get('focus_guard_meta', {}).get('active') is True
+    assert meta.get('focus_guard_meta', {}).get('completed') == 6
+
+
+def test_focus_guard_skips_when_focus_samples_insufficient(load_app):
+    app_module = load_app()
+    conn = app_module.get_db()
+    rows = [
+        ('fh1', '2026-03-07', '10:02:00', 1, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.8),
+        ('fh2', '2026-03-07', '10:06:00', 2, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'success', 0.5),
+        ('fh3', '2026-03-07', '13:35:00', 3, 'sz002438', '江苏神通', 'SELL', 1, 10.0, 'd', 'success', 0.7),
+        ('fh4', '2026-03-07', '14:10:00', 4, 'sz002438', '江苏神通', 'SELL', 1, 10.0, 'd', 'success', 0.5),
+    ]
+    conn.executemany(
+        """
+        INSERT INTO signals (id, date, time, seq_no, code, name, type, level, price, desc, status, profit_pct)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows
+    )
+    conn.commit()
+    conn.close()
+
+    with app_module.state_lock:
+        app_module.success_rates['risk_block_open_slot'] = False
+        app_module.success_rates['risk_block_close_slot'] = False
+        app_module.success_rates['regime_filter_enabled'] = False
+        app_module.success_rates['buy_require_confirmation'] = False
+        app_module.success_rates['buy_reject_bearish_tape'] = False
+        app_module.success_rates['focus_guard_enabled'] = True
+
+    accepted, reasons, meta = app_module.should_accept_signal(
+        'sz002438',
+        {'type': 'BUY', 'date': '2026-03-07', 'time': '10:20:00', 'bull_score': 0.95, 'bear_score': 0.1, 'factors': []}
+    )
+
+    assert accepted is True
+    assert reasons == []
+    assert meta.get('focus_guard_meta', {}).get('insufficient_samples') is True
+
+
+def test_focus_side_cooldown_blocks_same_side_only(load_app):
+    app_module = load_app()
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    conn = app_module.get_db()
+    rows = [
+        ('fc1', today, '10:01:00', 1, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.7),
+        ('fc2', today, '10:05:00', 2, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.4),
+        ('fc3', today, '10:11:00', 3, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'success', 0.4),
+        ('fc4', today, '10:18:00', 4, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.3),
+    ]
+    conn.executemany(
+        """
+        INSERT INTO signals (id, date, time, seq_no, code, name, type, level, price, desc, status, profit_pct)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows
+    )
+    conn.commit()
+    conn.close()
+
+    with app_module.state_lock:
+        app_module.success_rates['risk_block_open_slot'] = False
+        app_module.success_rates['risk_block_close_slot'] = False
+        app_module.success_rates['regime_filter_enabled'] = False
+        app_module.success_rates['buy_require_confirmation'] = False
+        app_module.success_rates['buy_reject_bearish_tape'] = False
+        app_module.success_rates['focus_guard_enabled'] = True
+    app_module.reset_risk_state_for_day(today)
+
+    app_module.update_risk_state_on_resolution(
+        {'id': 'live1', 'code': 'sz002438', 'type': 'BUY', 'date': today, 'time': '10:26:00', 'profit_pct': -0.6},
+        'fail'
+    )
+    app_module.update_risk_state_on_resolution(
+        {'id': 'live2', 'code': 'sz002438', 'type': 'BUY', 'date': today, 'time': '10:33:00', 'profit_pct': -0.5},
+        'fail'
+    )
+
+    paused, left_sec, reason = app_module.is_focus_side_paused('sz002438', 'BUY')
+    assert paused is True
+    assert left_sec > 0
+    assert reason == 'focus_side_fail_streak'
+
+    accepted_buy, buy_reasons, buy_meta = app_module.should_accept_signal(
+        'sz002438',
+        {'type': 'BUY', 'date': today, 'time': '10:36:00', 'bull_score': 0.95, 'bear_score': 0.1, 'factors': []}
+    )
+    assert accepted_buy is False
+    assert 'focus_side_cooled_down' in buy_reasons
+    assert buy_meta.get('focus_side_pause_left_sec', 0) > 0
+
+    accepted_sell, sell_reasons, sell_meta = app_module.should_accept_signal(
+        'sz002438',
+        {'type': 'SELL', 'date': today, 'time': '10:36:00', 'bull_score': 0.1, 'bear_score': 0.95, 'factors': []}
+    )
+    assert accepted_sell is True
+    assert sell_reasons == []
+    assert sell_meta.get('focus_guard_meta', {}).get('active') is True
+
+
+def test_build_data_payload_includes_focus_guard_status(load_app):
+    app_module = load_app()
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    conn = app_module.get_db()
+    rows = [
+        ('fd1', today, '10:01:00', 1, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.7),
+        ('fd2', today, '10:05:00', 2, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.4),
+        ('fd3', today, '10:11:00', 3, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'success', 0.4),
+        ('fd4', today, '10:18:00', 4, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.3),
+        ('fd5', today, '13:35:00', 5, 'sz002438', '江苏神通', 'SELL', 1, 10.0, 'd', 'success', 0.7),
+        ('fd6', today, '14:10:00', 6, 'sz002438', '江苏神通', 'SELL', 1, 10.0, 'd', 'success', 0.5),
+    ]
+    conn.executemany(
+        """
+        INSERT INTO signals (id, date, time, seq_no, code, name, type, level, price, desc, status, profit_pct)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows
+    )
+    conn.commit()
+    conn.close()
+
+    with app_module.state_lock:
+        app_module.success_rates['focus_guard_enabled'] = True
+    app_module.reset_risk_state_for_day(today)
+    app_module.update_risk_state_on_resolution(
+        {'id': 'live3', 'code': 'sz002438', 'type': 'BUY', 'date': today, 'time': '10:26:00', 'profit_pct': -0.6},
+        'fail'
+    )
+    app_module.update_risk_state_on_resolution(
+        {'id': 'live4', 'code': 'sz002438', 'type': 'BUY', 'date': today, 'time': '10:33:00', 'profit_pct': -0.5},
+        'fail'
+    )
+
+    payload = app_module.build_data_payload(force_full=True)
+    focus_guard = payload['focus_guard']
+
+    assert focus_guard['code'] == 'sz002438'
+    assert focus_guard['enabled'] is True
+    assert focus_guard['completed'] >= 6
+    assert focus_guard['cooldowns']['BUY']['paused'] is True
+    assert focus_guard['cooldowns']['BUY']['left_sec'] > 0
+    assert focus_guard['stage'] in ('cooldown', 'guarded')
+
+
+def test_build_data_payload_includes_rejection_monitor(load_app):
+    app_module = load_app()
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+
+    app_module.log_debug_event(
+        'signal_accepted',
+        {
+            'date': today,
+            'code': 'sz002438',
+            'name': '江苏神通',
+            'signal_type': 'BUY'
+        },
+        target_date=today
+    )
+    app_module.log_debug_event(
+        'signal_rejected',
+        {
+            'date': today,
+            'code': 'sz002438',
+            'name': '江苏神通',
+            'signal_type': 'BUY',
+            'reasons': ['focus_guard_weak_slot']
+        },
+        target_date=today
+    )
+    app_module.log_debug_event(
+        'signal_rejected',
+        {
+            'date': today,
+            'code': 'sz002438',
+            'name': '江苏神通',
+            'signal_type': 'SELL',
+            'reasons': ['focus_guard_weak_slot']
+        },
+        target_date=today
+    )
+    app_module.log_debug_event(
+        'signal_rejected',
+        {
+            'date': today,
+            'code': 'sh600079',
+            'name': '测试股票',
+            'signal_type': 'BUY',
+            'reasons': ['risk_slot_block_open']
+        },
+        target_date=today
+    )
+
+    payload = app_module.build_data_payload(force_full=True)
+    monitor = payload['rejection_monitor']
+
+    assert monitor['focus_code'] == 'sz002438'
+    assert monitor['overall']['rejected'] == 3
+    assert monitor['overall']['accepted'] == 1
+    assert monitor['focus']['rejected'] == 2
+    assert monitor['focus']['accepted'] == 1
+    assert monitor['focus']['buy_rejected'] == 1
+    assert monitor['focus']['sell_rejected'] == 1
+    assert monitor['focus']['top_reasons'][0]['reason'] == 'focus_guard_weak_slot'
+    assert monitor['focus']['top_reasons'][0]['count'] == 2
+    assert monitor['focus_sides']['BUY']['stage'] in ('normal', 'watch')
+    assert monitor['focus_sides']['BUY']['recent_total'] >= 1
+    assert monitor['stage'] in ('normal', 'watch')
+
+
+def test_build_data_payload_marks_hot_focus_side_pressure(load_app):
+    app_module = load_app()
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+
+    app_module.log_debug_event(
+        'signal_accepted',
+        {
+            'date': today,
+            'code': 'sz002438',
+            'name': '江苏神通',
+            'signal_type': 'BUY'
+        },
+        target_date=today
+    )
+    for idx in range(3):
+        app_module.log_debug_event(
+            'signal_rejected',
+            {
+                'date': today,
+                'code': 'sz002438',
+                'name': '江苏神通',
+                'signal_type': 'BUY',
+                'reasons': ['focus_side_pressure_tightening']
+            },
+            target_date=today
+        )
+
+    payload = app_module.build_data_payload(force_full=True)
+    monitor = payload['rejection_monitor']
+    buy_side = monitor['focus_sides']['BUY']
+
+    assert buy_side['stage'] == 'hot'
+    assert buy_side['recent_total'] == 4
+    assert buy_side['recent_reject_rate'] == 75.0
+    assert buy_side['threshold_add'] == 0.04
+    assert any(item['side'] == 'BUY' for item in monitor['pressure_alerts'])
+    assert monitor['stage'] == 'hot'
+
+
+
+def test_should_accept_signal_tightens_focus_buy_threshold_when_pressure_hot(load_app):
+    app_module = load_app()
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+
+    with app_module.state_lock:
+        app_module.success_rates['risk_block_open_slot'] = False
+        app_module.success_rates['risk_block_close_slot'] = False
+        app_module.success_rates['regime_filter_enabled'] = False
+        app_module.success_rates['buy_require_confirmation'] = False
+        app_module.success_rates['buy_reject_bearish_tape'] = False
+        app_module.success_rates['focus_guard_enabled'] = True
+
+    app_module.log_debug_event(
+        'signal_accepted',
+        {
+            'date': today,
+            'code': 'sz002438',
+            'name': '江苏神通',
+            'signal_type': 'BUY'
+        },
+        target_date=today
+    )
+    for idx in range(3):
+        app_module.log_debug_event(
+            'signal_rejected',
+            {
+                'date': today,
+                'code': 'sz002438',
+                'name': '江苏神通',
+                'signal_type': 'BUY',
+                'reasons': ['focus_guard_weak_slot']
+            },
+            target_date=today
+        )
+
+    base_threshold = float(app_module.get_effective_strategy('10:20:00', code='sz002438')['buy_min_score'])
+    score = round(base_threshold + 0.01, 4)
+
+    accepted, reasons, meta = app_module.should_accept_signal(
+        'sz002438',
+        {'type': 'BUY', 'date': today, 'time': '10:20:00', 'bull_score': score, 'bear_score': 0.1, 'factors': []}
+    )
+
+    assert accepted is False
+    assert 'focus_side_pressure_tightening' in reasons
+    assert any(reason.startswith('buy_score<') for reason in reasons)
+    assert meta['base_threshold'] == round(base_threshold, 4)
+    assert meta['threshold_add'] == 0.04
+    assert meta['threshold'] == round(base_threshold + 0.04, 4)
+    assert meta['pressure_meta']['stage'] == 'hot'
+
+
+def test_build_data_payload_includes_focus_review(load_app):
+    app_module = load_app()
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    conn = app_module.get_db()
+    rows = [
+        ('fr1', today, '09:42:00', 1, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'success', 0.8),
+        ('fr2', today, '10:18:00', 2, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.5),
+        ('fr3', today, '13:36:00', 3, 'sz002438', '江苏神通', 'SELL', 1, 10.0, 'd', 'success', 0.6),
+        ('fr4', today, '14:42:00', 4, 'sz002438', '江苏神通', 'SELL', 1, 10.0, 'd', 'fail', -0.3),
+    ]
+    conn.executemany(
+        """
+        INSERT INTO signals (id, date, time, seq_no, code, name, type, level, price, desc, status, profit_pct)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows
+    )
+    conn.commit()
+    conn.close()
+
+    payload = app_module.build_data_payload(force_full=True)
+    review = payload['focus_review']
+
+    assert review['code'] == 'sz002438'
+    assert review['name'] == '江苏神通'
+    assert review['completed'] == 4
+    assert review['by_type']['BUY']['completed'] == 2
+    assert review['by_type']['SELL']['completed'] == 2
+    assert len(review['recent_resolved']) == 4
+    assert review['recent_resolved'][0]['time'] == '14:42:00'
+    assert review['stage'] in ('normal', 'watch')
 
 
 def test_risk_guard_pause_triggered_by_drawdown(load_app):
@@ -453,3 +826,116 @@ def test_tuning_apply_accepts_edge_diagnostics_patch(load_app):
     strategy_after = payload['strategy_after']['stock_strategies']['sz002438']
     assert strategy_after['buy_min_score'] == patch_stock['buy_min_score']
     assert strategy_after['signal_profile']['signal_threshold'] == patch_stock['signal_profile']['signal_threshold']
+
+
+def test_auto_focus_tuning_applies_once_per_date(load_app):
+    app_module = load_app()
+    conn = app_module.get_db()
+    rows = [
+        ('c1', '2026-03-07', '09:35:00', 1, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.8),
+        ('c2', '2026-03-07', '09:48:00', 2, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.5),
+        ('c3', '2026-03-07', '10:12:00', 3, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'success', 0.6),
+        ('c4', '2026-03-07', '13:08:00', 4, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.4),
+        ('c5', '2026-03-07', '13:42:00', 5, 'sz002438', '江苏神通', 'SELL', 1, 10.0, 'd', 'success', 0.7),
+        ('c6', '2026-03-07', '14:36:00', 6, 'sz002438', '江苏神通', 'SELL', 1, 10.0, 'd', 'success', 0.5),
+    ]
+    conn.executemany(
+        """
+        INSERT INTO signals (id, date, time, seq_no, code, name, type, level, price, desc, status, profit_pct)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows
+    )
+    conn.commit()
+    conn.close()
+
+    app_module.ensure_stock_strategy('sz002438')
+    result = app_module.maybe_auto_apply_focus_tuning('2026-03-07')
+
+    assert result['applied'] is True
+    assert result['snapshot_id'] is not None
+    assert result['run_id'] is not None
+    assert os.path.exists(result['saved_path'])
+
+    run = app_module.get_tuning_run('2026-03-07', 'sz002438')
+    assert run is not None
+
+    patch_stock = result['applied_patch']['stock_strategies']['sz002438']
+    strategy_after = app_module.get_strategy_snapshot()['stock_strategies']['sz002438']
+    assert strategy_after['buy_min_score'] == patch_stock['buy_min_score']
+    assert strategy_after['signal_profile']['signal_threshold'] == patch_stock['signal_profile']['signal_threshold']
+
+    again = app_module.maybe_auto_apply_focus_tuning('2026-03-07')
+    assert again['applied'] is False
+    assert again['reason'] == 'already_applied'
+
+
+def test_auto_focus_tuning_prefers_target_date_weak_side_and_slot(load_app):
+    app_module = load_app()
+    conn = app_module.get_db()
+    rows = [
+        ('e1', '2026-03-06', '09:35:00', 1, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'success', 0.8),
+        ('e2', '2026-03-06', '10:05:00', 2, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'success', 0.5),
+        ('e3', '2026-03-06', '13:08:00', 3, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'success', 0.6),
+        ('e4', '2026-03-06', '13:42:00', 4, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'success', 0.4),
+        ('e5', '2026-03-07', '10:18:00', 5, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'success', 0.3),
+        ('e6', '2026-03-07', '14:35:00', 6, 'sz002438', '江苏神通', 'SELL', 1, 10.0, 'd', 'fail', -0.7),
+        ('e7', '2026-03-07', '14:42:00', 7, 'sz002438', '江苏神通', 'SELL', 1, 10.0, 'd', 'fail', -0.4),
+    ]
+    conn.executemany(
+        """
+        INSERT INTO signals (id, date, time, seq_no, code, name, type, level, price, desc, status, profit_pct)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows
+    )
+    conn.commit()
+    conn.close()
+
+    app_module.ensure_stock_strategy('sz002438')
+    before_templates = app_module.get_time_slot_templates_for_code('sz002438')
+    before_base = app_module.derive_baseline_strategy_from_templates(before_templates)
+    result = app_module.maybe_auto_apply_focus_tuning('2026-03-07')
+
+    assert result['applied'] is True
+    patch_stock = result['applied_patch']['stock_strategies']['sz002438']
+    assert 'sell_min_score' in patch_stock
+    assert 'buy_min_score' not in patch_stock
+    assert round(patch_stock['sell_min_score'] - before_base['sell_min_score'], 4) == 0.01
+    assert patch_stock['time_slot_templates']['close']['sell_min_score'] == round(before_templates['close']['sell_min_score'] + 0.01, 4)
+    assert result['auto_meta']['selected_side'] == 'SELL'
+    assert result['auto_meta']['selected_slot'] == 'close'
+    assert any('SELL 偏弱' in line for line in result['patch_summary'])
+
+
+def test_auto_focus_tuning_skips_without_focus_samples_on_target_date(load_app):
+    app_module = load_app()
+    conn = app_module.get_db()
+    rows = [
+        ('d1', '2026-03-06', '09:35:00', 1, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.8),
+        ('d2', '2026-03-06', '09:48:00', 2, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.5),
+        ('d3', '2026-03-06', '10:12:00', 3, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'success', 0.6),
+        ('d4', '2026-03-06', '13:08:00', 4, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.4),
+        ('d5', '2026-03-06', '13:42:00', 5, 'sz002438', '江苏神通', 'SELL', 1, 10.0, 'd', 'success', 0.7),
+        ('d6', '2026-03-06', '14:36:00', 6, 'sz002438', '江苏神通', 'SELL', 1, 10.0, 'd', 'success', 0.5),
+    ]
+    conn.executemany(
+        """
+        INSERT INTO signals (id, date, time, seq_no, code, name, type, level, price, desc, status, profit_pct)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows
+    )
+    conn.commit()
+    conn.close()
+
+    app_module.ensure_stock_strategy('sz002438')
+    before = app_module.get_strategy_snapshot()['stock_strategies']['sz002438']
+    result = app_module.maybe_auto_apply_focus_tuning('2026-03-07')
+
+    assert result['applied'] is False
+    assert result['reason'] == 'no_focus_samples_on_target_date'
+    assert app_module.get_tuning_run('2026-03-07', 'sz002438') is None
+
+    after = app_module.get_strategy_snapshot()['stock_strategies']['sz002438']
+    assert after == before

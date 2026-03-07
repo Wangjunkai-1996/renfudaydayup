@@ -103,6 +103,48 @@
             <div id="preclose-alert-list" class="mt-2 grid grid-cols-1 xl:grid-cols-2 gap-2 text-[11px]"></div>
         </div>
 
+        <div id="focus-guard-panel" class="mb-4 rounded-xl border border-slate-700/80 bg-slate-800/70 px-4 py-3 shadow-lg">
+            <div class="flex items-center justify-between gap-3">
+                <div class="flex items-center gap-2 flex-wrap">
+                    <span id="focus-guard-badge" class="text-[10px] px-2 py-0.5 rounded border border-slate-600 text-slate-300 bg-slate-700/50">防守状态</span>
+                    <span id="focus-guard-title" class="text-sm text-slate-100 font-medium">数据加载中...</span>
+                </div>
+                <span id="focus-guard-summary" class="text-[11px] text-slate-400 border border-slate-600/60 rounded px-2 py-0.5">--</span>
+            </div>
+            <div id="focus-guard-details" class="mt-2 flex flex-wrap gap-2 text-[11px]">
+                <div class="text-slate-500">等待运行态数据...</div>
+            </div>
+        </div>
+
+        <div id="rejection-monitor-panel" class="mb-4 rounded-xl border border-slate-700/80 bg-slate-800/70 px-4 py-3 shadow-lg">
+            <div class="flex items-center justify-between gap-3">
+                <div class="flex items-center gap-2 flex-wrap">
+                    <span id="rejection-monitor-badge" class="text-[10px] px-2 py-0.5 rounded border border-slate-600 text-slate-300 bg-slate-700/50">拒绝画像</span>
+                    <span id="rejection-monitor-title" class="text-sm text-slate-100 font-medium">数据加载中...</span>
+                </div>
+                <span id="rejection-monitor-summary" class="text-[11px] text-slate-400 border border-slate-600/60 rounded px-2 py-0.5">--</span>
+            </div>
+            <div id="rejection-monitor-details" class="mt-2 flex flex-wrap gap-2 text-[11px]">
+                <div class="text-slate-500">等待拒绝原因数据...</div>
+            </div>
+        </div>
+
+        <div id="focus-review-panel" class="mb-4 rounded-xl border border-slate-700/80 bg-slate-800/70 px-4 py-3 shadow-lg">
+            <div class="flex items-center justify-between gap-3">
+                <div class="flex items-center gap-2 flex-wrap">
+                    <span id="focus-review-badge" class="text-[10px] px-2 py-0.5 rounded border border-slate-600 text-slate-300 bg-slate-700/50">焦点复盘</span>
+                    <span id="focus-review-title" class="text-sm text-slate-100 font-medium">数据加载中...</span>
+                </div>
+                <span id="focus-review-summary" class="text-[11px] text-slate-400 border border-slate-600/60 rounded px-2 py-0.5">--</span>
+            </div>
+            <div id="focus-review-chips" class="mt-2 flex flex-wrap gap-2 text-[11px]">
+                <div class="text-slate-500">等待复盘数据...</div>
+            </div>
+            <div id="focus-review-list" class="mt-2 space-y-1 text-[11px]">
+                <div class="text-slate-500">等待最近平仓样本...</div>
+            </div>
+        </div>
+
         <div class="grid grid-cols-1 xl:grid-cols-4 gap-6">
             <!-- Left Region -->
             <div class="xl:col-span-3 space-y-6 flex flex-col">
@@ -372,6 +414,9 @@
             global: { indices: [], update_time: '' },
             pre_close: {},
             paper: null,
+            focus_guard: null,
+            rejection_monitor: null,
+            focus_review: null,
             is_trading: false,
             focus_stock_code: '',
             focus_stock_name: '',
@@ -448,6 +493,9 @@
                     global: payload.global || { indices: [], update_time: '' },
                     pre_close: payload.pre_close || {},
                     paper: payload.paper || null,
+                    focus_guard: payload.focus_guard || null,
+                    rejection_monitor: payload.rejection_monitor || null,
+                    focus_review: payload.focus_review || null,
                     is_trading: !!payload.is_trading,
                     focus_stock_code: payload.focus_stock_code || '',
                     focus_stock_name: payload.focus_stock_name || '',
@@ -496,6 +544,9 @@
                 viewState.global = payload.global || { indices: [], update_time: '' };
                 viewState.pre_close = payload.pre_close || {};
                 viewState.paper = payload.paper || null;
+                viewState.focus_guard = payload.focus_guard || viewState.focus_guard || null;
+                viewState.rejection_monitor = payload.rejection_monitor || viewState.rejection_monitor || null;
+                viewState.focus_review = payload.focus_review || viewState.focus_review || null;
                 viewState.is_trading = !!payload.is_trading;
                 viewState.focus_stock_code = payload.focus_stock_code || viewState.focus_stock_code || '';
                 viewState.focus_stock_name = payload.focus_stock_name || viewState.focus_stock_name || '';
@@ -531,6 +582,9 @@
             }
             updateUI(data);
             renderPreCloseAlerts(data.pre_close || {});
+            renderFocusGuardStatus(data.focus_guard || null);
+            renderRejectionMonitor(data.rejection_monitor || null);
+            renderFocusReview(data.focus_review || null);
             renderPaperPanel(data.paper || null, data.active_stocks || {}, data.current || {});
             fetchStrategyPanels();
 
@@ -1488,6 +1542,329 @@
                 });
             }
         }
+
+        function formatSecondsCompact(seconds) {
+            const total = Math.max(0, Math.round(Number(seconds || 0)));
+            const mins = Math.floor(total / 60);
+            const secs = total % 60;
+            if (mins <= 0) return `${secs}s`;
+            if (mins < 60) return `${mins}m ${secs}s`;
+            const hours = Math.floor(mins / 60);
+            const restMins = mins % 60;
+            return `${hours}h ${restMins}m`;
+        }
+
+        function renderFocusGuardStatus(status) {
+            const panel = document.getElementById('focus-guard-panel');
+            const badge = document.getElementById('focus-guard-badge');
+            const title = document.getElementById('focus-guard-title');
+            const summary = document.getElementById('focus-guard-summary');
+            const details = document.getElementById('focus-guard-details');
+            if (!panel || !badge || !title || !summary || !details) return;
+
+            const payload = status || {};
+            const stage = payload.stage || 'warming';
+            const code = payload.code || viewState.focus_stock_code || '';
+            const name = payload.name || viewState.focus_stock_name || '聚焦标的';
+            const completed = Number(payload.completed || 0);
+            const winRate = Number(payload.win_rate || 0);
+            const avgProfit = Number(payload.avg_profit_pct || 0);
+            const lookbackDays = Number(payload.lookback_days || 0);
+            const cooldowns = payload.cooldowns || {};
+            const buyCooldown = cooldowns.BUY || {};
+            const sellCooldown = cooldowns.SELL || {};
+            const weakSides = Array.isArray(payload.weak_sides) ? payload.weak_sides : [];
+            const weakSlots = Array.isArray(payload.weak_slots) ? payload.weak_slots : [];
+            const notes = Array.isArray(payload.notes) ? payload.notes : [];
+
+            let badgeClass = 'text-[10px] px-2 py-0.5 rounded border ';
+            let panelClass = 'mb-4 rounded-xl px-4 py-3 shadow-lg ';
+            if (stage === 'cooldown') {
+                badgeClass += 'border-rose-400/40 text-rose-200 bg-rose-500/20';
+                panelClass += 'border border-rose-500/30 bg-rose-500/10';
+            } else if (stage === 'guarded') {
+                badgeClass += 'border-amber-400/40 text-amber-200 bg-amber-500/20';
+                panelClass += 'border border-amber-500/30 bg-amber-500/10';
+            } else if (stage === 'normal') {
+                badgeClass += 'border-emerald-400/40 text-emerald-200 bg-emerald-500/15';
+                panelClass += 'border border-emerald-500/25 bg-emerald-500/10';
+            } else if (stage === 'disabled') {
+                badgeClass += 'border-slate-500/40 text-slate-300 bg-slate-700/40';
+                panelClass += 'border border-slate-700/80 bg-slate-800/70';
+            } else {
+                badgeClass += 'border-sky-400/30 text-sky-200 bg-sky-500/15';
+                panelClass += 'border border-sky-500/25 bg-sky-500/10';
+            }
+            panel.className = panelClass;
+            badge.className = badgeClass;
+
+            if (stage === 'cooldown') {
+                badge.innerText = '弱侧冷却';
+            } else if (stage === 'guarded') {
+                badge.innerText = '防守增强';
+            } else if (stage === 'normal') {
+                badge.innerText = '放行正常';
+            } else if (stage === 'disabled') {
+                badge.innerText = '防守关闭';
+            } else {
+                badge.innerText = '样本观察';
+            }
+
+            title.innerText = payload.title || `${name} ${code}`;
+            summary.innerText = `${name}${code ? ' ' + code : ''} · 样本 ${completed} · WR ${winRate.toFixed(1)}% · 均笔 ${avgProfit >= 0 ? '+' : ''}${avgProfit.toFixed(3)}%`;
+
+            const chips = [];
+            if (lookbackDays > 0) {
+                chips.push(`<div class="px-2 py-1 rounded border border-slate-600/70 bg-slate-900/40 text-slate-300">观察窗 ${lookbackDays} 天</div>`);
+            }
+            if (buyCooldown.paused) {
+                chips.push(`<div class="px-2 py-1 rounded border border-rose-500/40 bg-rose-500/10 text-rose-200">BUY 冷却中 · 剩余 ${formatSecondsCompact(buyCooldown.left_sec)}</div>`);
+            } else if (buyCooldown.fail_streak) {
+                chips.push(`<div class="px-2 py-1 rounded border border-slate-600/70 bg-slate-900/40 text-slate-300">BUY 连败 ${Number(buyCooldown.fail_streak || 0)} 次</div>`);
+            }
+            if (sellCooldown.paused) {
+                chips.push(`<div class="px-2 py-1 rounded border border-rose-500/40 bg-rose-500/10 text-rose-200">SELL 冷却中 · 剩余 ${formatSecondsCompact(sellCooldown.left_sec)}</div>`);
+            } else if (sellCooldown.fail_streak) {
+                chips.push(`<div class="px-2 py-1 rounded border border-slate-600/70 bg-slate-900/40 text-slate-300">SELL 连败 ${Number(sellCooldown.fail_streak || 0)} 次</div>`);
+            }
+            weakSides.slice(0, 2).forEach(item => {
+                chips.push(`<div class="px-2 py-1 rounded border border-amber-500/40 bg-amber-500/10 text-amber-100">${escapeHtml(item.side || '--')} 偏弱 ${Number(item.win_rate || 0).toFixed(1)}% / ${Number(item.completed || 0)} 笔</div>`);
+            });
+            weakSlots.slice(0, 2).forEach(item => {
+                chips.push(`<div class="px-2 py-1 rounded border border-amber-500/30 bg-amber-500/10 text-amber-100">${escapeHtml(item.label || item.slot || '--')} 偏弱 ${Number(item.win_rate || 0).toFixed(1)}%</div>`);
+            });
+            notes.slice(0, 2).forEach(line => {
+                chips.push(`<div class="px-2 py-1 rounded border border-slate-600/70 bg-slate-900/40 text-slate-300">${escapeHtml(line)}</div>`);
+            });
+
+            details.innerHTML = chips.length ? chips.join('') : '<div class="text-slate-500">当前暂无额外防守提示</div>';
+        }
+
+        function formatRejectReason(reason) {
+            const key = String(reason || '');
+            const reasonMap = {
+                focus_side_cooled_down: '弱侧冷却中',
+                focus_guard_weak_side: '该方向近样本偏弱',
+                focus_guard_weak_slot: '该时段整体偏弱',
+                focus_guard_weak_slot_side: '该时段该方向偏弱',
+                buy_missing_confirmation: '买点缺少确认',
+                buy_bearish_tape_detected: '盘口偏空',
+                buy_auto_paused: 'BUY 自动暂停',
+                regime_low_wr: '近期总胜率不足',
+                regime_slot_low_wr: '该时段近期胜率不足',
+                regime_trend_not_aligned: '趋势未对齐',
+                regime_health_unstable: '行情源不稳定',
+                regime_block_open_close: '开收盘窗口禁开',
+                risk_guard_paused: '总风控暂停',
+                risk_slot_block_open: '开盘段禁开',
+                risk_slot_block_close: '尾盘禁开',
+                pre_close_no_new_position: '临近收盘不再开新仓',
+                focus_side_pressure_tightening: '方向阈值已动态收紧'
+            };
+            if (reasonMap[key]) return reasonMap[key];
+            if (key.startsWith('buy_score<')) return `BUY 分数不足 ${key.split('<')[1] || ''}`;
+            if (key.startsWith('sell_score<')) return `SELL 分数不足 ${key.split('<')[1] || ''}`;
+            return key || '--';
+        }
+
+        function renderRejectionMonitor(snapshot) {
+            const panel = document.getElementById('rejection-monitor-panel');
+            const badge = document.getElementById('rejection-monitor-badge');
+            const title = document.getElementById('rejection-monitor-title');
+            const summary = document.getElementById('rejection-monitor-summary');
+            const details = document.getElementById('rejection-monitor-details');
+            if (!panel || !badge || !title || !summary || !details) return;
+
+            const payload = snapshot || {};
+            const stage = payload.stage || 'idle';
+            const focus = payload.focus || {};
+            const overall = payload.overall || {};
+            const focusName = payload.focus_name || viewState.focus_stock_name || '聚焦标的';
+            const focusCode = payload.focus_code || viewState.focus_stock_code || '';
+            const focusReasons = Array.isArray(focus.top_reasons) ? focus.top_reasons : [];
+            const overallReasons = Array.isArray(overall.top_reasons) ? overall.top_reasons : [];
+            const notes = Array.isArray(payload.notes) ? payload.notes : [];
+            const pressureAlerts = Array.isArray(payload.pressure_alerts) ? payload.pressure_alerts : [];
+            const focusSides = payload.focus_sides || {};
+            const focusGuard = viewState.focus_guard || {};
+            const cooldowns = focusGuard.cooldowns || {};
+            const weakSides = Array.isArray(focusGuard.weak_sides) ? focusGuard.weak_sides : [];
+            const weakSlots = Array.isArray(focusGuard.weak_slots) ? focusGuard.weak_slots : [];
+            const focusAccepted = Number(focus.accepted || 0);
+            const focusRejected = Number(focus.rejected || 0);
+            const overallAccepted = Number(overall.accepted || 0);
+            const overallRejected = Number(overall.rejected || 0);
+            const focusTotal = focusAccepted + focusRejected;
+            const overallTotal = overallAccepted + overallRejected;
+            const focusRejectRate = focusTotal > 0 ? (focusRejected / focusTotal) * 100 : null;
+            const overallRejectRate = overallTotal > 0 ? (overallRejected / overallTotal) * 100 : null;
+
+            let badgeClass = 'text-[10px] px-2 py-0.5 rounded border ';
+            let panelClass = 'mb-4 rounded-xl px-4 py-3 shadow-lg ';
+            if (stage === 'hot') {
+                badgeClass += 'border-rose-400/40 text-rose-200 bg-rose-500/20';
+                panelClass += 'border border-rose-500/30 bg-rose-500/10';
+            } else if (stage === 'watch') {
+                badgeClass += 'border-amber-400/40 text-amber-200 bg-amber-500/20';
+                panelClass += 'border border-amber-500/30 bg-amber-500/10';
+            } else if (stage === 'normal') {
+                badgeClass += 'border-sky-400/30 text-sky-200 bg-sky-500/15';
+                panelClass += 'border border-sky-500/25 bg-sky-500/10';
+            } else {
+                badgeClass += 'border-slate-500/40 text-slate-300 bg-slate-700/40';
+                panelClass += 'border border-slate-700/80 bg-slate-800/70';
+            }
+            panel.className = panelClass;
+            badge.className = badgeClass;
+            badge.innerText = stage === 'hot' ? '拦截堆积' : (stage === 'watch' ? '拦截观察' : (stage === 'normal' ? '正常过滤' : '暂未堆积'));
+
+            title.innerText = payload.title || '拒绝原因监控';
+            summary.innerText = `${focusName}${focusCode ? ' ' + focusCode : ''} · 焦点拦截 ${Number(focus.rejected || 0)} · 全局拦截 ${Number(overall.rejected || 0)}`;
+
+            const chips = [];
+            chips.push(`<div class="px-2 py-1 rounded border border-slate-600/70 bg-slate-900/40 text-slate-300">焦点放行 ${focusAccepted}</div>`);
+            chips.push(`<div class="px-2 py-1 rounded border border-slate-600/70 bg-slate-900/40 text-slate-300">焦点拒绝 ${focusRejected}</div>`);
+            if (focusRejectRate !== null) {
+                const tone = focusRejectRate >= 60
+                    ? 'border-rose-500/30 bg-rose-500/10 text-rose-100'
+                    : (focusRejectRate >= 40 ? 'border-amber-500/30 bg-amber-500/10 text-amber-100' : 'border-slate-600/70 bg-slate-900/40 text-slate-300');
+                chips.push(`<div class="px-2 py-1 rounded border ${tone}">焦点拒绝率 ${focusRejectRate.toFixed(1)}%</div>`);
+            }
+            if (overallRejectRate !== null) {
+                chips.push(`<div class="px-2 py-1 rounded border border-slate-600/70 bg-slate-900/40 text-slate-300">全局拒绝率 ${overallRejectRate.toFixed(1)}%</div>`);
+            }
+            if (Number(focus.buy_rejected || 0) > 0) {
+                chips.push(`<div class="px-2 py-1 rounded border border-amber-500/30 bg-amber-500/10 text-amber-100">BUY 被拦 ${Number(focus.buy_rejected || 0)}</div>`);
+            }
+            if (Number(focus.sell_rejected || 0) > 0) {
+                chips.push(`<div class="px-2 py-1 rounded border border-amber-500/30 bg-amber-500/10 text-amber-100">SELL 被拦 ${Number(focus.sell_rejected || 0)}</div>`);
+            }
+            ['BUY', 'SELL'].forEach(side => {
+                const stat = focusSides[side] || {};
+                const stageText = stat.stage === 'hot' ? '高压' : (stat.stage === 'watch' ? '观察' : '正常');
+                const tone = stat.stage === 'hot'
+                    ? 'border-rose-500/30 bg-rose-500/10 text-rose-100'
+                    : (stat.stage === 'watch' ? 'border-amber-500/30 bg-amber-500/10 text-amber-100' : 'border-slate-600/70 bg-slate-900/40 text-slate-300');
+                if (Number(stat.total || 0) > 0) {
+                    const recentRate = Number(stat.recent_reject_rate || 0).toFixed(1);
+                    chips.push(`<div class="px-2 py-1 rounded border ${tone}">${side} ${stageText} · 近${Number(stat.recent_total || 0)}笔拒绝率 ${recentRate}%</div>`);
+                }
+                if (Number(stat.threshold_add || 0) > 0) {
+                    chips.push(`<div class="px-2 py-1 rounded border ${tone}">${side} 阈值收紧 +${Number(stat.threshold_add || 0).toFixed(2)}</div>`);
+                }
+            });
+            ['BUY', 'SELL'].forEach(side => {
+                const item = cooldowns[side] || {};
+                if (!item.paused) return;
+                const leftMin = Math.max(1, Math.ceil(Number(item.left_sec || 0) / 60));
+                chips.push(`<div class="px-2 py-1 rounded border border-fuchsia-500/30 bg-fuchsia-500/10 text-fuchsia-100">${side} 冷却中 ${leftMin} 分钟</div>`);
+            });
+            weakSides.slice(0, 1).forEach(item => {
+                chips.push(`<div class="px-2 py-1 rounded border border-orange-500/30 bg-orange-500/10 text-orange-100">弱侧 ${escapeHtml(item.side || '--')} · ${Number(item.win_rate || 0).toFixed(1)}%</div>`);
+            });
+            weakSlots.slice(0, 1).forEach(item => {
+                chips.push(`<div class="px-2 py-1 rounded border border-orange-500/30 bg-orange-500/10 text-orange-100">弱时段 ${escapeHtml(item.label || item.slot || '--')} · ${Number(item.win_rate || 0).toFixed(1)}%</div>`);
+            });
+            pressureAlerts.slice(0, 2).forEach(item => {
+                const tone = item.stage === 'hot'
+                    ? 'border-rose-500/30 bg-rose-500/10 text-rose-100'
+                    : 'border-amber-500/30 bg-amber-500/10 text-amber-100';
+                chips.push(`<div class="px-2 py-1 rounded border ${tone}">${escapeHtml(item.side || '--')} 连续被拦 ${Number(item.consecutive_rejected || 0)} 次</div>`);
+            });
+            focusReasons.slice(0, 3).forEach(item => {
+                chips.push(`<div class="px-2 py-1 rounded border border-rose-500/30 bg-rose-500/10 text-rose-100">焦点 · ${escapeHtml(formatRejectReason(item.reason))} × ${Number(item.count || 0)}</div>`);
+            });
+            overallReasons.slice(0, 2).forEach(item => {
+                chips.push(`<div class="px-2 py-1 rounded border border-slate-600/70 bg-slate-900/40 text-slate-300">全局 · ${escapeHtml(formatRejectReason(item.reason))} × ${Number(item.count || 0)}</div>`);
+            });
+            notes.slice(0, 2).forEach(line => {
+                chips.push(`<div class="px-2 py-1 rounded border border-slate-600/70 bg-slate-900/40 text-slate-300">${escapeHtml(line)}</div>`);
+            });
+
+            details.innerHTML = chips.length ? chips.join('') : '<div class="text-slate-500">当前暂无明显拒绝堆积</div>';
+        }
+
+        function renderFocusReview(snapshot) {
+            const panel = document.getElementById('focus-review-panel');
+            const badge = document.getElementById('focus-review-badge');
+            const title = document.getElementById('focus-review-title');
+            const summary = document.getElementById('focus-review-summary');
+            const chipsEl = document.getElementById('focus-review-chips');
+            const listEl = document.getElementById('focus-review-list');
+            if (!panel || !badge || !title || !summary || !chipsEl || !listEl) return;
+
+            const payload = snapshot || {};
+            const stage = payload.stage || 'warming';
+            const byType = payload.by_type || {};
+            const bestSlot = payload.best_slot || {};
+            const worstSlot = payload.worst_slot || {};
+            const strengths = Array.isArray(payload.strengths) ? payload.strengths : [];
+            const risks = Array.isArray(payload.risks) ? payload.risks : [];
+            const recentResolved = Array.isArray(payload.recent_resolved) ? payload.recent_resolved : [];
+
+            let badgeClass = 'text-[10px] px-2 py-0.5 rounded border ';
+            let panelClass = 'mb-4 rounded-xl px-4 py-3 shadow-lg ';
+            if (stage === 'strong') {
+                badgeClass += 'border-emerald-400/40 text-emerald-200 bg-emerald-500/20';
+                panelClass += 'border border-emerald-500/25 bg-emerald-500/10';
+            } else if (stage === 'watch') {
+                badgeClass += 'border-amber-400/40 text-amber-200 bg-amber-500/20';
+                panelClass += 'border border-amber-500/30 bg-amber-500/10';
+            } else if (stage === 'normal') {
+                badgeClass += 'border-sky-400/30 text-sky-200 bg-sky-500/15';
+                panelClass += 'border border-sky-500/25 bg-sky-500/10';
+            } else {
+                badgeClass += 'border-slate-500/40 text-slate-300 bg-slate-700/40';
+                panelClass += 'border border-slate-700/80 bg-slate-800/70';
+            }
+            panel.className = panelClass;
+            badge.className = badgeClass;
+            badge.innerText = stage === 'strong' ? '结构较稳' : (stage === 'watch' ? '复盘重点' : (stage === 'normal' ? '持续跟踪' : '样本积累'));
+
+            const focusName = payload.name || viewState.focus_stock_name || '聚焦标的';
+            title.innerText = payload.title || '焦点复盘';
+            summary.innerText = `${focusName} · ${Number(payload.lookback_days || 0)}天完成 ${Number(payload.completed || 0)} · 胜率 ${Number(payload.win_rate || 0).toFixed(1)}%`;
+
+            const chips = [];
+            ['BUY', 'SELL'].forEach(side => {
+                const item = byType[side] || {};
+                if (Number(item.completed || 0) <= 0) return;
+                const tone = side === 'BUY'
+                    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-100'
+                    : 'border-rose-500/30 bg-rose-500/10 text-rose-100';
+                chips.push(`<div class="px-2 py-1 rounded border ${tone}">${side} ${Number(item.completed || 0)}笔 · ${Number(item.win_rate || 0).toFixed(1)}%</div>`);
+            });
+            if (bestSlot.slot) {
+                chips.push(`<div class="px-2 py-1 rounded border border-emerald-500/30 bg-emerald-500/10 text-emerald-100">最强 ${escapeHtml(bestSlot.label || bestSlot.slot || '--')} · ${Number(bestSlot.win_rate || 0).toFixed(1)}%</div>`);
+            }
+            if (worstSlot.slot) {
+                chips.push(`<div class="px-2 py-1 rounded border border-amber-500/30 bg-amber-500/10 text-amber-100">最弱 ${escapeHtml(worstSlot.label || worstSlot.slot || '--')} · ${Number(worstSlot.win_rate || 0).toFixed(1)}%</div>`);
+            }
+            strengths.slice(0, 1).forEach(line => {
+                chips.push(`<div class="px-2 py-1 rounded border border-emerald-500/30 bg-emerald-500/10 text-emerald-100">${escapeHtml(line)}</div>`);
+            });
+            risks.slice(0, 2).forEach(line => {
+                chips.push(`<div class="px-2 py-1 rounded border border-amber-500/30 bg-amber-500/10 text-amber-100">${escapeHtml(line)}</div>`);
+            });
+            chipsEl.innerHTML = chips.length ? chips.join('') : '<div class="text-slate-500">当前复盘样本仍偏少</div>';
+
+            listEl.innerHTML = recentResolved.length ? recentResolved.slice(0, 5).map(item => {
+                const status = String(item.status || '') === 'success';
+                const tone = status
+                    ? 'border-emerald-500/20 bg-emerald-500/5'
+                    : 'border-rose-500/20 bg-rose-500/5';
+                const profitTone = status ? 'text-emerald-300' : 'text-rose-300';
+                return `
+                    <div class="grid grid-cols-[0.8fr_0.7fr_0.7fr_1fr_0.8fr] gap-2 rounded border ${tone} px-2 py-1.5">
+                        <div class="text-slate-400">${escapeHtml((item.date || '').slice(5))} ${escapeHtml(item.time || '--')}</div>
+                        <div class="text-slate-200">${escapeHtml(item.type || '--')}</div>
+                        <div class="text-slate-300">${escapeHtml(item.slot_label || '--')}</div>
+                        <div class="${profitTone}">${Number(item.profit_pct || 0).toFixed(2)}%</div>
+                        <div class="${status ? 'text-emerald-300' : 'text-rose-300'}">${status ? '止盈' : '止损'}</div>
+                    </div>`;
+            }).join('') : '<div class="text-slate-500">暂无最近平仓样本</div>';
+        }
+
 
         function renderPreCloseAlerts(preClose) {
             const panel = document.getElementById('preclose-alert-panel');

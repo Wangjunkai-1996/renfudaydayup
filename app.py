@@ -94,6 +94,43 @@ try:
 except Exception:
     API_DATA_MAX_POINTS = 1200
 
+AUTO_FOCUS_TUNING_KIND = 'focus_auto'
+AUTO_FOCUS_TUNING_ENABLED_DEFAULT = _env_bool('AUTO_FOCUS_TUNING_ENABLED', '1')
+try:
+    AUTO_FOCUS_TUNING_MIN_SAMPLES_DEFAULT = max(6, min(20, int(os.getenv('AUTO_FOCUS_TUNING_MIN_SAMPLES', '6'))))
+except Exception:
+    AUTO_FOCUS_TUNING_MIN_SAMPLES_DEFAULT = 6
+FOCUS_GUARD_ENABLED_DEFAULT = _env_bool('FOCUS_GUARD_ENABLED', '1')
+FOCUS_GUARD_SIDE_WR_FLOOR = 42.0
+FOCUS_GUARD_SLOT_WR_FLOOR = 38.0
+FOCUS_GUARD_SLOT_SIDE_WR_FLOOR = 35.0
+FOCUS_GUARD_CACHE_TTL_SEC = 20
+FOCUS_SIDE_COOLDOWN_STREAK = 2
+FOCUS_SIDE_COOLDOWN_MINUTES = 25
+FOCUS_SIDE_COOLDOWN_MIN_SAMPLES = 4
+FOCUS_SIDE_COOLDOWN_WR_FLOOR = 45.0
+REJECTION_MONITOR_CACHE_TTL_SEC = 10
+FOCUS_SIDE_PRESSURE_MIN_DECISIONS = 4
+FOCUS_SIDE_PRESSURE_RECENT_DECISIONS = 6
+FOCUS_SIDE_PRESSURE_WATCH_REJECT_RATE = 60.0
+FOCUS_SIDE_PRESSURE_HOT_REJECT_RATE = 75.0
+FOCUS_SIDE_PRESSURE_WATCH_STREAK = 2
+FOCUS_SIDE_PRESSURE_HOT_STREAK = 3
+FOCUS_SIDE_PRESSURE_WATCH_DELTA = 0.02
+FOCUS_SIDE_PRESSURE_HOT_DELTA = 0.04
+AUTO_FOCUS_TUNING_SIDE_STEP = 0.01
+AUTO_FOCUS_TUNING_SIDE_HOT_STEP = 0.015
+AUTO_FOCUS_TUNING_SLOT_STEP = 0.01
+AUTO_FOCUS_TUNING_PROFILE_STEP = 0.01
+AUTO_FOCUS_TUNING_EDGE_STEP = 0.005
+AUTO_FOCUS_TUNING_RANGE_STEP = 0.0003
+AUTO_FOCUS_TUNING_DAY_SIDE_MIN_SAMPLES = 2
+AUTO_FOCUS_TUNING_DAY_SLOT_MIN_SAMPLES = 2
+AUTO_FOCUS_TUNING_DAY_SIDE_WR_FLOOR = 50.0
+AUTO_FOCUS_TUNING_LOOKBACK_SIDE_WR_FLOOR = 45.0
+AUTO_FOCUS_TUNING_DAY_SLOT_WR_FLOOR = 50.0
+AUTO_FOCUS_TUNING_LOOKBACK_SLOT_WR_FLOOR = 45.0
+
 DEFAULT_SIGNAL_PROFILE = {
     'name': 'generic_intraday_t',
     'min_points': 10,
@@ -184,6 +221,7 @@ STRATEGY_BOOL_KEYS = (
     'buy_require_confirmation', 'buy_reject_bearish_tape',
     'buy_auto_pause', 'close_pending_after_market',
     'debug_log_enabled', 'auto_daily_report_enabled',
+    'auto_focus_tuning_enabled', 'focus_guard_enabled',
     'time_slot_enabled', 'risk_guard_enabled',
     'risk_block_open_slot', 'risk_block_close_slot',
     'regime_filter_enabled', 'regime_require_trend_alignment',
@@ -203,6 +241,7 @@ STRATEGY_INT_KEYS = (
     'risk_max_consecutive_fail', 'risk_stock_max_consecutive_fail',
     'risk_pause_minutes',
     'regime_lookback_days', 'regime_min_samples', 'regime_slot_min_samples',
+    'auto_focus_tuning_min_samples',
     'paper_min_lot'
 )
 
@@ -322,6 +361,9 @@ def log_debug_event(event, payload=None, target_date=None):
         with debug_log_lock:
             with open(path, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+        if event in ('signal_rejected', 'signal_accepted', 'signal_resolved', 'signal_force_closed'):
+            with state_lock:
+                rejection_monitor_cache.clear()
     except Exception as e:
         print(f"debug log write error: {e}")
 
@@ -644,6 +686,42 @@ def get_param_version(version_id):
         'params': params
     }
 
+def get_tuning_run(target_date, code, kind=AUTO_FOCUS_TUNING_KIND):
+    conn = get_db()
+    row = conn.execute(
+        'SELECT id, target_date, code, kind, created_at, payload_json FROM tuning_runs WHERE target_date=? AND code=? AND kind=? ORDER BY id DESC LIMIT 1',
+        (str(target_date or ''), str(code or '').strip().lower(), str(kind or ''))
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    try:
+        payload = json.loads(row['payload_json'])
+    except Exception:
+        payload = {}
+    return {
+        'id': row['id'],
+        'target_date': row['target_date'],
+        'code': row['code'],
+        'kind': row['kind'],
+        'created_at': row['created_at'],
+        'payload': payload
+    }
+
+def save_tuning_run(target_date, code, kind=AUTO_FOCUS_TUNING_KIND, payload=None):
+    target = str(target_date or '')
+    normalized_code = str(code or '').strip().lower()
+    normalized_kind = str(kind or '')
+    payload_json = json.dumps(payload or {}, ensure_ascii=False)
+    conn = get_db()
+    conn.execute(
+        'INSERT OR IGNORE INTO tuning_runs (target_date, code, kind, payload_json) VALUES (?,?,?,?)',
+        (target, normalized_code, normalized_kind, payload_json)
+    )
+    conn.commit()
+    conn.close()
+    return get_tuning_run(target, normalized_code, normalized_kind)
+
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -698,6 +776,17 @@ def init_db():
             params_json TEXT NOT NULL
         )
     ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS tuning_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target_date TEXT NOT NULL,
+            code TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            payload_json TEXT NOT NULL DEFAULT '{}'
+        )
+    ''')
+    conn.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_tuning_runs_target_code_kind ON tuning_runs(target_date, code, kind)')
     ensure_watchlist_table(conn)
     conn.execute('''
         CREATE TABLE IF NOT EXISTS paper_account (
@@ -875,6 +964,7 @@ def db_resolve_signal(sig_id, status, resolved_price=0.0, gross_profit_pct=0.0, 
         conn.close()
         with state_lock:
             quality_cache.clear()
+            focus_guard_cache.clear()
     except Exception as e:
         print(f'db resolve error: {e}')
 
@@ -895,6 +985,7 @@ def db_delete_signals_by_code(code, target_date=None):
         rebuild_daily_stats()
         with state_lock:
             quality_cache.clear()
+            focus_guard_cache.clear()
     return deleted
 
 def load_today_signals():
@@ -974,6 +1065,11 @@ success_rates = {
     'debug_log_enabled': True,
     # 收盘后自动生成日报
     'auto_daily_report_enabled': True,
+    # 聚焦票自动细调：样本够时按诊断自动收紧一次
+    'auto_focus_tuning_enabled': AUTO_FOCUS_TUNING_ENABLED_DEFAULT,
+    'auto_focus_tuning_min_samples': AUTO_FOCUS_TUNING_MIN_SAMPLES_DEFAULT,
+    # 聚焦票实时防守：弱侧/弱时段直接限流，优先保胜率
+    'focus_guard_enabled': FOCUS_GUARD_ENABLED_DEFAULT,
     'stocks': {},
     'stock_strategies': {}
 }
@@ -989,6 +1085,9 @@ risk_state = {
     'day': '',
     'consecutive_fail': 0,
     'stock_consecutive_fail': {},
+    'focus_side_fail_streak': {},
+    'focus_side_paused_until': {},
+    'focus_side_pause_reason': {},
     'daily_profit_pct': 0.0,
     'peak_daily_profit_pct': 0.0,
     'paused_until_ts': 0.0,
@@ -1010,6 +1109,8 @@ health_state = {
     'alerts': []
 }
 quality_cache = {}  # key -> {'ts': float, 'value': {...}}
+focus_guard_cache = {}  # key -> {'ts': float, 'value': {...}}
+rejection_monitor_cache = {}  # key -> {'ts': float, 'value': {...}}
 trade_calendar = TradeCalendar(
     ak_module=ak,
     refresh_sec=TRADE_CAL_REFRESH_SEC
@@ -2087,11 +2188,28 @@ def reset_risk_state_for_day(day_str):
         risk_state['day'] = day_str
         risk_state['consecutive_fail'] = 0
         risk_state['stock_consecutive_fail'] = {}
+        risk_state['focus_side_fail_streak'] = {}
+        risk_state['focus_side_paused_until'] = {}
+        risk_state['focus_side_pause_reason'] = {}
         risk_state['daily_profit_pct'] = 0.0
         risk_state['peak_daily_profit_pct'] = 0.0
         risk_state['paused_until_ts'] = 0.0
         risk_state['pause_reason'] = ''
         risk_state['trigger_count'] = 0
+
+def is_focus_side_paused(code, sig_type, now_ts=None):
+    c = str(code or '').strip().lower()
+    side = str(sig_type or '').strip().upper()
+    if c != FOCUS_STOCK_CODE or side not in ('BUY', 'SELL'):
+        return False, 0.0, ''
+
+    ts_now = float(now_ts or time.time())
+    with state_lock:
+        paused_until = float((risk_state.get('focus_side_paused_until', {}) or {}).get(side, 0.0) or 0.0)
+        reason = str((risk_state.get('focus_side_pause_reason', {}) or {}).get(side, '') or '')
+    if paused_until <= ts_now:
+        return False, 0.0, reason
+    return True, max(0.0, paused_until - ts_now), reason
 
 def is_risk_paused():
     now_ts = time.time()
@@ -2131,13 +2249,77 @@ def maybe_trigger_risk_pause(reason, context=None):
         context=context
     )
 
-def update_risk_state_on_resolution(sig, final_status):
+def maybe_trigger_focus_side_cooldown(sig, final_status, event_ts=None, replay_mode=False):
+    code = str(sig.get('code') or '').strip().lower()
+    sig_type = str(sig.get('type') or '').strip().upper()
+    if code != FOCUS_STOCK_CODE or sig_type not in ('BUY', 'SELL') or final_status != 'fail':
+        return
+
+    with state_lock:
+        if not bool(success_rates.get('focus_guard_enabled', FOCUS_GUARD_ENABLED_DEFAULT)):
+            return
+        streak = int((risk_state.get('focus_side_fail_streak', {}) or {}).get(sig_type, 0) or 0)
+    if streak < FOCUS_SIDE_COOLDOWN_STREAK:
+        return
+
+    strategy = get_effective_strategy(sig.get('time'), code=code)
+    lookback_days = max(5, min(20, int(strategy.get('regime_lookback_days', 7) or 7)))
+    slot = get_time_slot_label(sig.get('time'))
+    quality = get_recent_regime_quality(code, sig_type, slot, lookback_days=lookback_days)
+    sample = int(quality.get('sample', 0) or 0)
+    success = int(round(float(quality.get('win_rate', 0.0) or 0.0) * sample)) if sample > 0 else 0
+    profit_sum = float(quality.get('avg_profit_pct', 0.0) or 0.0) * sample if sample > 0 else 0.0
+
+    if not replay_mode:
+        sample += 1
+        if final_status == 'success':
+            success += 1
+        profit_sum += float(sig.get('profit_pct') or 0.0)
+
+    if sample < FOCUS_SIDE_COOLDOWN_MIN_SAMPLES:
+        return
+
+    win_rate = success * 100.0 / sample if sample > 0 else 0.0
+    avg_profit_pct = profit_sum / sample if sample > 0 else 0.0
+    if win_rate >= FOCUS_SIDE_COOLDOWN_WR_FLOOR and avg_profit_pct >= 0:
+        return
+
+    trigger_ts = float(event_ts or time.time())
+    paused_until = trigger_ts + FOCUS_SIDE_COOLDOWN_MINUTES * 60
+    reason = 'focus_side_fail_streak'
+    with state_lock:
+        pause_map = dict(risk_state.get('focus_side_paused_until', {}))
+        reason_map = dict(risk_state.get('focus_side_pause_reason', {}))
+        pause_map[sig_type] = max(float(pause_map.get(sig_type, 0.0) or 0.0), paused_until)
+        reason_map[sig_type] = reason
+        risk_state['focus_side_paused_until'] = pause_map
+        risk_state['focus_side_pause_reason'] = reason_map
+
+    log_debug_event(
+        'focus_side_cooldown_triggered',
+        {
+            'code': code,
+            'signal_type': sig_type,
+            'signal_id': sig.get('id'),
+            'streak': streak,
+            'sample': sample,
+            'win_rate': round(win_rate, 2),
+            'avg_profit_pct': round(avg_profit_pct, 4),
+            'pause_minutes': FOCUS_SIDE_COOLDOWN_MINUTES,
+            'paused_until_ts': paused_until,
+            'reason': reason
+        },
+        target_date=sig.get('date')
+    )
+
+def update_risk_state_on_resolution(sig, final_status, event_ts=None, replay_mode=False):
     now = datetime.datetime.now()
     today = now.strftime('%Y-%m-%d')
     strategy = get_effective_strategy(sig.get('time'), code=sig.get('code'))
     if not strategy.get('risk_guard_enabled', True):
         return
 
+    sig_type = str(sig.get('type') or '').strip().upper()
     with state_lock:
         if risk_state.get('day') != today:
             reset_risk_state_for_day(today)
@@ -2157,6 +2339,14 @@ def update_risk_state_on_resolution(sig, final_status):
             stock_streak[code] = 0
         risk_state['stock_consecutive_fail'] = stock_streak
 
+        focus_side_streak = dict(risk_state.get('focus_side_fail_streak', {}))
+        if code == FOCUS_STOCK_CODE and sig_type in ('BUY', 'SELL'):
+            if final_status == 'fail':
+                focus_side_streak[sig_type] = int(focus_side_streak.get(sig_type, 0)) + 1
+            else:
+                focus_side_streak[sig_type] = 0
+        risk_state['focus_side_fail_streak'] = focus_side_streak
+
         if final_status == 'fail':
             risk_state['consecutive_fail'] = int(risk_state.get('consecutive_fail', 0)) + 1
         else:
@@ -2167,6 +2357,8 @@ def update_risk_state_on_resolution(sig, final_status):
         peak_profit = float(risk_state.get('peak_daily_profit_pct', 0.0))
         drawdown = max(0.0, peak_profit - daily_profit)
         stock_fail_streak = int(stock_streak.get(code, 0)) if code else 0
+
+    maybe_trigger_focus_side_cooldown(sig, final_status, event_ts=event_ts, replay_mode=replay_mode)
 
     if consecutive_fail >= int(strategy.get('risk_max_consecutive_fail', 4)):
         maybe_trigger_risk_pause(
@@ -2202,7 +2394,7 @@ def init_risk_state_from_db():
         conn = get_db()
         rows = conn.execute(
             '''
-            SELECT id, code, status, profit_pct
+            SELECT id, code, type, date, time, status, profit_pct, resolved_at, created_at
             FROM signals
             WHERE date=? AND status IN ('success','fail')
             ORDER BY COALESCE(resolved_at, created_at) ASC
@@ -2215,8 +2407,16 @@ def init_risk_state_from_db():
         return
 
     for r in rows:
-        fake_sig = {'id': r['id'], 'code': r['code'], 'profit_pct': float(r['profit_pct'] or 0.0)}
-        update_risk_state_on_resolution(fake_sig, r['status'])
+        fake_sig = {
+            'id': r['id'],
+            'code': r['code'],
+            'type': r['type'],
+            'date': r['date'],
+            'time': r['time'],
+            'profit_pct': float(r['profit_pct'] or 0.0)
+        }
+        event_ts = parse_iso_ts(r['resolved_at'] or r['created_at'])
+        update_risk_state_on_resolution(fake_sig, r['status'], event_ts=event_ts, replay_mode=True)
 
 def update_health_alerts():
     now_ts = time.time()
@@ -2453,6 +2653,89 @@ def evaluate_regime_gate(code, sig, effective):
     }
     return len(reasons) == 0, reasons, meta
 
+def get_focus_guard_diagnostics(code=None, end_date=None, lookback_days=None):
+    target = normalize_date_str(end_date, fallback_today=True)
+    if not target:
+        target = datetime.datetime.now().strftime('%Y-%m-%d')
+    c = str(code or FOCUS_STOCK_CODE).strip().lower() or FOCUS_STOCK_CODE
+    days = max(5, min(int(lookback_days or 7), 20))
+    cache_key = (c, target, days)
+    now_ts = time.time()
+
+    with state_lock:
+        cached = focus_guard_cache.get(cache_key)
+        if cached and now_ts - float(cached.get('ts', 0.0) or 0.0) <= FOCUS_GUARD_CACHE_TTL_SEC:
+            return copy.deepcopy(cached.get('value') or {})
+
+    diagnostics = compute_edge_diagnostics(days=days, end_date=target, focus_code=c)
+    with state_lock:
+        focus_guard_cache[cache_key] = {
+            'ts': now_ts,
+            'value': copy.deepcopy(diagnostics)
+        }
+    return diagnostics
+
+def evaluate_focus_guard(code, sig, effective):
+    normalized_code = str(code or '').strip().lower()
+    sig_type = str(sig.get('type') or '').strip().upper()
+    slot = str(effective.get('slot') or get_time_slot_label(sig.get('time')))
+
+    with state_lock:
+        enabled = bool(success_rates.get('focus_guard_enabled', FOCUS_GUARD_ENABLED_DEFAULT))
+        min_samples = max(1, int(success_rates.get('auto_focus_tuning_min_samples', AUTO_FOCUS_TUNING_MIN_SAMPLES_DEFAULT) or AUTO_FOCUS_TUNING_MIN_SAMPLES_DEFAULT))
+        lookback_days = max(5, min(20, int(effective.get('regime_lookback_days', 7) or 7)))
+
+    meta = {
+        'focus_guard_enabled': enabled,
+        'slot': slot,
+        'lookback_days': lookback_days,
+        'min_samples': min_samples,
+        'focus_code': FOCUS_STOCK_CODE
+    }
+    if (not enabled) or normalized_code != FOCUS_STOCK_CODE or sig_type not in ('BUY', 'SELL'):
+        meta['active'] = False
+        return True, [], meta
+
+    diagnostics = get_focus_guard_diagnostics(code=normalized_code, end_date=sig.get('date'), lookback_days=lookback_days)
+    focus_item = (diagnostics or {}).get('focus') or {}
+    completed = int(focus_item.get('completed', 0) or 0)
+    meta['active'] = True
+    meta['completed'] = completed
+    if completed < min_samples:
+        meta['insufficient_samples'] = True
+        return True, [], meta
+
+    reasons = []
+    side_metrics = (focus_item.get('by_type') or {}).get(sig_type, {})
+    side_completed = int(side_metrics.get('completed', 0) or 0)
+    side_wr = float(side_metrics.get('win_rate', 0.0) or 0.0)
+    meta['side_completed'] = side_completed
+    meta['side_win_rate'] = round(side_wr, 2)
+    if side_completed >= 4 and side_wr < FOCUS_GUARD_SIDE_WR_FLOOR:
+        reasons.append('focus_guard_weak_side')
+
+    slot_item = None
+    for item in (focus_item.get('slots') or []):
+        if str(item.get('slot') or '') == slot:
+            slot_item = item
+            break
+    slot_completed = int((slot_item or {}).get('completed', 0) or 0)
+    slot_wr = float((slot_item or {}).get('win_rate', 0.0) or 0.0)
+    meta['slot_completed'] = slot_completed
+    meta['slot_win_rate'] = round(slot_wr, 2)
+    if slot_completed >= 3 and slot_wr < FOCUS_GUARD_SLOT_WR_FLOOR:
+        reasons.append('focus_guard_weak_slot')
+
+    slot_side = ((slot_item or {}).get('by_type') or {}).get(sig_type, {})
+    slot_side_completed = int(slot_side.get('completed', 0) or 0)
+    slot_side_wr = float(slot_side.get('win_rate', 0.0) or 0.0)
+    meta['slot_side_completed'] = slot_side_completed
+    meta['slot_side_win_rate'] = round(slot_side_wr, 2)
+    if slot_side_completed >= 2 and slot_side_wr < FOCUS_GUARD_SLOT_SIDE_WR_FLOOR:
+        reasons.append('focus_guard_weak_slot_side')
+
+    return len(reasons) == 0, reasons, meta
+
 def should_accept_signal(code, sig):
     """信号入库前统一风控过滤。返回 (accepted, reasons, meta)。"""
     sig_type = sig.get('type')
@@ -2491,6 +2774,17 @@ def should_accept_signal(code, sig):
         }
         return False, reasons, meta
 
+    focus_side_paused, focus_side_left, focus_side_reason = is_focus_side_paused(code, sig_type)
+    if focus_side_paused:
+        reasons.append('focus_side_cooled_down')
+        meta = {
+            'signal_type': sig_type,
+            'slot': effective.get('slot'),
+            'focus_side_pause_left_sec': round(focus_side_left, 2),
+            'focus_side_pause_reason': focus_side_reason
+        }
+        return False, reasons, meta
+
     if is_pre_close_window():
         reasons.append('pre_close_no_new_position')
         return False, reasons, {
@@ -2507,17 +2801,38 @@ def should_accept_signal(code, sig):
             'regime_meta': regime_meta
         }
 
+    focus_guard_ok, focus_guard_reasons, focus_guard_meta = evaluate_focus_guard(code, sig, effective)
+    if not focus_guard_ok:
+        reasons.extend(focus_guard_reasons)
+        return False, reasons, {
+            'signal_type': sig_type,
+            'slot': effective.get('slot'),
+            'regime_meta': regime_meta,
+            'focus_guard_meta': focus_guard_meta
+        }
+
+    pressure_meta = get_focus_side_rejection_pressure(code, sig_type, target_date=sig.get('date'))
+
     if sig_type == 'BUY':
         bull_score = float(sig.get('bull_score', parse_signal_score(sig.get('desc', ''))))
+        base_buy_min_score = buy_min_score
+        pressure_delta = float(pressure_meta.get('threshold_add', 0.0) or 0.0)
+        applied_buy_min_score = min(0.88, base_buy_min_score + pressure_delta)
         meta = {
             'signal_type': sig_type,
             'score': round(bull_score, 4),
-            'threshold': buy_min_score,
+            'threshold': round(applied_buy_min_score, 4),
+            'base_threshold': round(base_buy_min_score, 4),
+            'threshold_add': round(pressure_delta, 4),
             'slot': effective.get('slot'),
-            'regime_meta': regime_meta
+            'regime_meta': regime_meta,
+            'focus_guard_meta': focus_guard_meta,
+            'pressure_meta': pressure_meta
         }
-        if bull_score < buy_min_score:
-            reasons.append(f"buy_score<{buy_min_score:.2f}")
+        if bull_score < applied_buy_min_score:
+            if pressure_delta > 0 and bull_score >= base_buy_min_score:
+                reasons.append('focus_side_pressure_tightening')
+            reasons.append(f"buy_score<{applied_buy_min_score:.2f}")
 
         has_bull_tape = any(('多头强盘口' in f) or ('盘口偏多' in f) for f in factors)
         has_bull_volume = any('放量拉升' in f for f in factors)
@@ -2544,16 +2859,25 @@ def should_accept_signal(code, sig):
 
     if sig_type == 'SELL':
         bear_score = float(sig.get('bear_score', parse_signal_score(sig.get('desc', ''))))
-        accepted = bear_score >= sell_min_score
+        base_sell_min_score = sell_min_score
+        pressure_delta = float(pressure_meta.get('threshold_add', 0.0) or 0.0)
+        applied_sell_min_score = min(0.88, base_sell_min_score + pressure_delta)
+        accepted = bear_score >= applied_sell_min_score
         meta = {
             'signal_type': sig_type,
             'score': round(bear_score, 4),
-            'threshold': sell_min_score,
+            'threshold': round(applied_sell_min_score, 4),
+            'base_threshold': round(base_sell_min_score, 4),
+            'threshold_add': round(pressure_delta, 4),
             'slot': effective.get('slot'),
-            'regime_meta': regime_meta
+            'regime_meta': regime_meta,
+            'focus_guard_meta': focus_guard_meta,
+            'pressure_meta': pressure_meta
         }
         if not accepted:
-            reasons.append(f"sell_score<{sell_min_score:.2f}")
+            if pressure_delta > 0 and bear_score >= base_sell_min_score:
+                reasons.append('focus_side_pressure_tightening')
+            reasons.append(f"sell_score<{applied_sell_min_score:.2f}")
         return accepted, reasons, meta
 
     return False, ['unknown_signal_type'], {'signal_type': sig_type}
@@ -3940,6 +4264,9 @@ def build_data_payload(since_ts=None, force_full=False):
             }
     pre_close_snapshot = build_pre_close_alert_snapshot(pending_snapshot, current_state)
     paper_snapshot = get_paper_snapshot(current_state, recent_limit=20)
+    focus_guard_snapshot = build_focus_guard_status_snapshot()
+    rejection_monitor_snapshot = build_rejection_monitor_snapshot()
+    focus_review_snapshot = build_focus_review_snapshot()
     sync_ts = int(time.time() * 1000)
 
     return {
@@ -3958,6 +4285,9 @@ def build_data_payload(since_ts=None, force_full=False):
         'global': global_snapshot,
         'pre_close': pre_close_snapshot,
         'paper': paper_snapshot,
+        'focus_guard': focus_guard_snapshot,
+        'rejection_monitor': rejection_monitor_snapshot,
+        'focus_review': focus_review_snapshot,
         'is_trading': is_trading_time(),
         'focus_stock_code': FOCUS_STOCK_CODE,
         'focus_stock_name': FOCUS_STOCK_NAME,
@@ -4270,6 +4600,785 @@ def compute_edge_diagnostics(days=15, end_date=None, focus_code=None):
         notes.append('当前真实样本还偏少，建议先累计到 6-10 笔已完成样本后再做自动细调')
     diagnostics['notes'] = notes
     return diagnostics
+
+
+def compute_focus_diagnostics_for_date(target_date, code=None):
+    target = normalize_date_str(target_date, fallback_today=False)
+    if not target:
+        return {}
+
+    c = str(code or FOCUS_STOCK_CODE).strip().lower() or FOCUS_STOCK_CODE
+    focus_name = FOCUS_STOCK_NAME_MAP.get(c, FOCUS_STOCK_NAME if c == FOCUS_STOCK_CODE else c)
+    rows = get_signal_rows(date_from=target, date_to=target)
+    diagnostics = build_edge_diagnostics_payload(rows, focus_code=c, focus_name=focus_name)
+    diagnostics['date_range'] = {
+        'from': target,
+        'to': target,
+        'days': 1
+    }
+    return diagnostics
+
+
+def build_auto_focus_patch_from_diagnostics(focus_item, target_date=None, code=None):
+    c = str(code or FOCUS_STOCK_CODE).strip().lower() or FOCUS_STOCK_CODE
+    target = normalize_date_str(target_date, fallback_today=True)
+    if not target:
+        target = datetime.datetime.now().strftime('%Y-%m-%d')
+    if not focus_item or str(focus_item.get('code') or '').strip().lower() != c:
+        return {}, [], {
+            'mode': 'focused_defensive_v2',
+            'target_date': target,
+            'selected_side': '',
+            'selected_slot': '',
+            'today_completed': 0,
+            'reason': 'focus_mismatch'
+        }
+
+    current_templates = get_time_slot_templates_for_code(c)
+    current_profile = get_stock_signal_profile(c)
+    baseline_strategy = derive_baseline_strategy_from_templates(current_templates)
+    current_strategy = get_effective_strategy(code=c)
+    current_buy = float(baseline_strategy.get('buy_min_score', current_strategy.get('buy_min_score', DEFAULT_BUY_MIN_SCORE)) or DEFAULT_BUY_MIN_SCORE)
+    current_sell = float(baseline_strategy.get('sell_min_score', current_strategy.get('sell_min_score', DEFAULT_SELL_MIN_SCORE)) or DEFAULT_SELL_MIN_SCORE)
+
+    today_diagnostics = compute_focus_diagnostics_for_date(target, c)
+    today_focus = (today_diagnostics or {}).get('focus') or {}
+    pressure_map = {
+        side: get_focus_side_rejection_pressure(c, side, target_date=target)
+        for side in ('BUY', 'SELL')
+    }
+
+    stock_patch = {}
+    patch_summary = []
+    meta = {
+        'mode': 'focused_defensive_v2',
+        'target_date': target,
+        'selected_side': '',
+        'selected_slot': '',
+        'today_completed': int(today_focus.get('completed', 0) or 0),
+        'today_win_rate': round(float(today_focus.get('win_rate', 0.0) or 0.0), 2),
+        'today_avg_profit_pct': round(float(today_focus.get('avg_profit_pct', 0.0) or 0.0), 4),
+        'pressure': copy.deepcopy(pressure_map)
+    }
+
+    def ensure_signal_profile_patch():
+        return stock_patch.setdefault('signal_profile', {})
+
+    def ensure_slot_patch(slot_name):
+        slot_templates = stock_patch.setdefault('time_slot_templates', {})
+        return slot_templates.setdefault(slot_name, {})
+
+    def stage_rank(stage_name):
+        return {'idle': 0, 'normal': 1, 'watch': 2, 'hot': 3}.get(str(stage_name or ''), 0)
+
+    def collect_side_candidate(side_name):
+        today_side = ((today_focus.get('by_type') or {}).get(side_name) or {})
+        lookback_side = ((focus_item.get('by_type') or {}).get(side_name) or {})
+        pressure = pressure_map.get(side_name) or {}
+        today_completed = int(today_side.get('completed', 0) or 0)
+        today_wr = float(today_side.get('win_rate', 0.0) or 0.0)
+        today_avg = float(today_side.get('avg_profit_pct', 0.0) or 0.0)
+        lookback_completed = int(lookback_side.get('completed', 0) or 0)
+        lookback_wr = float(lookback_side.get('win_rate', 0.0) or 0.0)
+        lookback_avg = float(lookback_side.get('avg_profit_pct', 0.0) or 0.0)
+        score = 0.0
+        reasons = []
+
+        pressure_stage = str(pressure.get('stage') or 'idle')
+        if pressure_stage == 'hot':
+            score += 120
+            reasons.append('pressure_hot')
+        elif pressure_stage == 'watch':
+            score += 80
+            reasons.append('pressure_watch')
+
+        if today_completed >= AUTO_FOCUS_TUNING_DAY_SIDE_MIN_SAMPLES:
+            if today_wr < AUTO_FOCUS_TUNING_DAY_SIDE_WR_FLOOR:
+                score += (AUTO_FOCUS_TUNING_DAY_SIDE_WR_FLOOR - today_wr) * 2.0
+                reasons.append('today_wr_low')
+            if today_avg < 0:
+                score += 18
+                reasons.append('today_profit_negative')
+        if lookback_completed >= 4:
+            if lookback_wr < AUTO_FOCUS_TUNING_LOOKBACK_SIDE_WR_FLOOR:
+                score += max(0.0, AUTO_FOCUS_TUNING_LOOKBACK_SIDE_WR_FLOOR - lookback_wr)
+                reasons.append('lookback_wr_low')
+            if lookback_avg < 0:
+                score += 8
+                reasons.append('lookback_profit_negative')
+
+        score += float(pressure.get('consecutive_rejected', 0) or 0) * 6.0
+        if score <= 0:
+            return None
+        return {
+            'side': side_name,
+            'score': round(score, 4),
+            'today': today_side,
+            'lookback': lookback_side,
+            'pressure': pressure,
+            'reasons': reasons
+        }
+
+    candidates = [item for item in (collect_side_candidate('BUY'), collect_side_candidate('SELL')) if item]
+    primary = None
+    if candidates:
+        primary = max(
+            candidates,
+            key=lambda item: (
+                float(item.get('score', 0.0) or 0.0),
+                stage_rank((item.get('pressure') or {}).get('stage')),
+                float(((item.get('pressure') or {}).get('recent_reject_rate', 0.0) or 0.0)),
+                -float(((item.get('today') or {}).get('win_rate', 100.0) or 100.0)),
+                -float(((item.get('lookback') or {}).get('win_rate', 100.0) or 100.0))
+            )
+        )
+
+    def pick_slot_candidate(side_name):
+        if side_name not in ('BUY', 'SELL'):
+            return None
+        slot_candidates = []
+        sources = [
+            ('today', today_focus, AUTO_FOCUS_TUNING_DAY_SLOT_MIN_SAMPLES, AUTO_FOCUS_TUNING_DAY_SLOT_WR_FLOOR, 100),
+            ('lookback', focus_item, AUTO_FOCUS_TUNING_DAY_SLOT_MIN_SAMPLES, AUTO_FOCUS_TUNING_LOOKBACK_SLOT_WR_FLOOR, 0)
+        ]
+        for source_name, source_item, min_samples, wr_floor, bonus in sources:
+            for slot_item in (source_item.get('slots') or []):
+                slot_side = ((slot_item.get('by_type') or {}).get(side_name) or {})
+                completed = int(slot_side.get('completed', 0) or 0)
+                if completed < min_samples:
+                    continue
+                win_rate = float(slot_side.get('win_rate', 0.0) or 0.0)
+                avg_profit_pct = float(slot_side.get('avg_profit_pct', 0.0) or 0.0)
+                if win_rate >= wr_floor and avg_profit_pct >= 0:
+                    continue
+                slot_score = float(bonus)
+                if win_rate < wr_floor:
+                    slot_score += (wr_floor - win_rate) * 2.0
+                if avg_profit_pct < 0:
+                    slot_score += 10
+                slot_candidates.append({
+                    'source': source_name,
+                    'slot': str(slot_item.get('slot') or ''),
+                    'label': str(slot_item.get('label') or slot_item.get('slot') or '--'),
+                    'completed': completed,
+                    'win_rate': round(win_rate, 2),
+                    'avg_profit_pct': round(avg_profit_pct, 4),
+                    'score': round(slot_score, 4)
+                })
+        if not slot_candidates:
+            return None
+        return max(
+            slot_candidates,
+            key=lambda item: (
+                float(item.get('score', 0.0) or 0.0),
+                1 if item.get('source') == 'today' else 0,
+                -float(item.get('win_rate', 100.0) or 100.0)
+            )
+        )
+
+    if primary:
+        side_name = str(primary.get('side') or '')
+        pressure = primary.get('pressure') or {}
+        today_side = primary.get('today') or {}
+        today_wr = float(today_side.get('win_rate', 0.0) or 0.0)
+        today_avg = float(today_side.get('avg_profit_pct', 0.0) or 0.0)
+        side_step = AUTO_FOCUS_TUNING_SIDE_HOT_STEP if stage_rank(pressure.get('stage')) >= stage_rank('hot') else AUTO_FOCUS_TUNING_SIDE_STEP
+        side_label = FOCUS_STOCK_NAME_MAP.get(c, c)
+        meta['selected_side'] = side_name
+
+        if side_name == 'BUY':
+            new_buy = min(0.84, current_buy + side_step)
+            if new_buy > current_buy:
+                stock_patch['buy_min_score'] = round(new_buy, 4)
+                patch_summary.append(f"{target} 当日 BUY 偏弱，自动细调 buy_min_score {current_buy:.2f}→{new_buy:.2f}")
+            profile_patch = ensure_signal_profile_patch()
+            current_threshold = float(current_profile.get('signal_threshold', DEFAULT_SIGNAL_PROFILE.get('signal_threshold', 0.55)) or 0.55)
+            current_edge = float(current_profile.get('edge_min', DEFAULT_SIGNAL_PROFILE.get('edge_min', 0.15)) or 0.15)
+            threshold_step = AUTO_FOCUS_TUNING_PROFILE_STEP if (stage_rank(pressure.get('stage')) >= stage_rank('watch') or today_avg < 0 or float(focus_item.get('avg_profit_pct', 0.0) or 0.0) < 0) else 0.0
+            edge_step = AUTO_FOCUS_TUNING_EDGE_STEP if (stage_rank(pressure.get('stage')) >= stage_rank('hot') or today_avg < 0) else 0.0
+            if threshold_step > 0:
+                new_threshold = min(0.72, current_threshold + threshold_step)
+                if new_threshold > current_threshold:
+                    profile_patch['signal_threshold'] = round(new_threshold, 4)
+                    patch_summary.append(f"{side_label} BUY 高压，signal_threshold {current_threshold:.2f}→{new_threshold:.2f}")
+            if edge_step > 0:
+                new_edge = min(0.24, current_edge + edge_step)
+                if new_edge > current_edge:
+                    profile_patch['edge_min'] = round(new_edge, 4)
+                    patch_summary.append(f"{side_label} BUY 高压，edge_min {current_edge:.3f}→{new_edge:.3f}")
+        elif side_name == 'SELL':
+            new_sell = min(0.82, current_sell + side_step)
+            if new_sell > current_sell:
+                stock_patch['sell_min_score'] = round(new_sell, 4)
+                patch_summary.append(f"{target} 当日 SELL 偏弱，自动细调 sell_min_score {current_sell:.2f}→{new_sell:.2f}")
+
+        slot_candidate = pick_slot_candidate(side_name)
+        if slot_candidate and slot_candidate.get('slot'):
+            meta['selected_slot'] = str(slot_candidate.get('slot') or '')
+            current_slot_cfg = current_templates.get(slot_candidate['slot'], {}) if isinstance(current_templates, dict) else {}
+            if side_name == 'BUY':
+                slot_now = float(current_slot_cfg.get('buy_min_score', current_buy) or current_buy)
+                slot_new = min(0.86, slot_now + AUTO_FOCUS_TUNING_SLOT_STEP)
+                if slot_new > slot_now:
+                    ensure_slot_patch(slot_candidate['slot'])['buy_min_score'] = round(slot_new, 4)
+                    patch_summary.append(f"{target} 优先收紧 {slot_candidate['label']} BUY，buy_min_score {slot_now:.2f}→{slot_new:.2f}")
+            elif side_name == 'SELL':
+                slot_now = float(current_slot_cfg.get('sell_min_score', current_sell) or current_sell)
+                slot_new = min(0.84, slot_now + AUTO_FOCUS_TUNING_SLOT_STEP)
+                if slot_new > slot_now:
+                    ensure_slot_patch(slot_candidate['slot'])['sell_min_score'] = round(slot_new, 4)
+                    patch_summary.append(f"{target} 优先收紧 {slot_candidate['label']} SELL，sell_min_score {slot_now:.2f}→{slot_new:.2f}")
+
+    if primary and int(focus_item.get('completed', 0) or 0) >= 8 and float(focus_item.get('avg_profit_pct', 0.0) or 0.0) < 0.0:
+        profile_patch = ensure_signal_profile_patch()
+        current_range = float(current_profile.get('min_intraday_range', DEFAULT_SIGNAL_PROFILE.get('min_intraday_range', 0.004)) or 0.004)
+        new_range = min(0.0100, current_range + AUTO_FOCUS_TUNING_RANGE_STEP)
+        if new_range > current_range:
+            profile_patch['min_intraday_range'] = round(new_range, 4)
+            patch_summary.append(f"整体均笔收益仍偏弱，轻微提高最小波动门槛 {current_range:.4f}→{new_range:.4f}")
+
+    if 'signal_profile' in stock_patch and not stock_patch['signal_profile']:
+        stock_patch.pop('signal_profile', None)
+    if 'time_slot_templates' in stock_patch and not stock_patch['time_slot_templates']:
+        stock_patch.pop('time_slot_templates', None)
+
+    if not stock_patch:
+        meta['reason'] = 'no_targeted_patch'
+        return {}, [], meta
+    return {'stock_strategies': {c: stock_patch}}, patch_summary, meta
+
+
+def _count_completed_focus_samples_on_date(target_date, code=None):
+    target = normalize_date_str(target_date, fallback_today=False)
+    if not target:
+        return 0
+    c = str(code or FOCUS_STOCK_CODE).strip().lower() or FOCUS_STOCK_CODE
+    rows = get_signal_rows(date_from=target, date_to=target)
+    return sum(1 for row in rows if str(row.get('code') or '').strip().lower() == c and str(row.get('status') or '').lower() in ('success', 'fail'))
+
+def maybe_auto_apply_focus_tuning(target_date=None):
+    target = normalize_date_str(target_date, fallback_today=True)
+    if not target:
+        target = datetime.datetime.now().strftime('%Y-%m-%d')
+
+    with state_lock:
+        enabled = bool(success_rates.get('auto_focus_tuning_enabled', AUTO_FOCUS_TUNING_ENABLED_DEFAULT))
+        min_samples = max(1, int(success_rates.get('auto_focus_tuning_min_samples', AUTO_FOCUS_TUNING_MIN_SAMPLES_DEFAULT) or AUTO_FOCUS_TUNING_MIN_SAMPLES_DEFAULT))
+        lookback_days = max(7, min(20, int(success_rates.get('regime_lookback_days', 7) or 7)))
+
+    focus_code = FOCUS_STOCK_CODE
+    focus_name = FOCUS_STOCK_NAME_MAP.get(focus_code, FOCUS_STOCK_NAME)
+
+    if not enabled:
+        return {
+            'applied': False,
+            'reason': 'disabled',
+            'target_date': target,
+            'focus_code': focus_code
+        }
+
+    existing_run = get_tuning_run(target, focus_code, AUTO_FOCUS_TUNING_KIND)
+    if existing_run:
+        return {
+            'applied': False,
+            'reason': 'already_applied',
+            'target_date': target,
+            'focus_code': focus_code,
+            'run_id': existing_run.get('id')
+        }
+
+    today_completed = _count_completed_focus_samples_on_date(target, focus_code)
+    if today_completed <= 0:
+        return {
+            'applied': False,
+            'reason': 'no_focus_samples_on_target_date',
+            'target_date': target,
+            'focus_code': focus_code
+        }
+
+    diagnostics = compute_edge_diagnostics(days=lookback_days, end_date=target, focus_code=focus_code)
+    focus_item = diagnostics.get('focus') or {}
+    completed = int(focus_item.get('completed', 0) or 0)
+    if completed < min_samples:
+        return {
+            'applied': False,
+            'reason': 'insufficient_samples',
+            'target_date': target,
+            'focus_code': focus_code,
+            'completed': completed,
+            'today_completed': today_completed,
+            'required_samples': min_samples
+        }
+
+    patch, patch_summary, auto_meta = build_auto_focus_patch_from_diagnostics(
+        focus_item,
+        target_date=target,
+        code=focus_code
+    )
+    if not isinstance(patch, dict) or not patch or not patch_summary:
+        return {
+            'applied': False,
+            'reason': 'no_patch',
+            'target_date': target,
+            'focus_code': focus_code,
+            'completed': completed,
+            'today_completed': today_completed,
+            'auto_meta': auto_meta
+        }
+
+    strategy_before = get_strategy_snapshot()
+    ok, errors, applied = apply_strategy_patch(patch)
+    if not ok:
+        return {
+            'applied': False,
+            'reason': 'invalid_patch',
+            'target_date': target,
+            'focus_code': focus_code,
+            'errors': errors,
+            'completed': completed,
+            'today_completed': today_completed
+        }
+
+    snapshot_id, _ = save_param_version(note=f'focus_tuning_auto {target} {focus_code}')
+    strategy_after = get_strategy_snapshot()
+    tuning_record = {
+        'date': target,
+        'generated_at': datetime.datetime.now().isoformat(timespec='seconds'),
+        'source': 'auto_focus_tuning',
+        'auto_applied': True,
+        'focus_code': focus_code,
+        'focus_name': focus_name,
+        'strategy_before': strategy_before,
+        'proposed_patch': applied,
+        'reasons': patch_summary,
+        'metrics': {
+            'focus_completed': completed,
+            'focus_today_completed': today_completed,
+            'focus_win_rate': round(float(focus_item.get('win_rate', 0.0) or 0.0), 2),
+            'focus_avg_profit_pct': round(float(focus_item.get('avg_profit_pct', 0.0) or 0.0), 4),
+            'lookback_days': lookback_days,
+            'auto_mode': auto_meta.get('mode'),
+            'selected_side': auto_meta.get('selected_side'),
+            'selected_slot': auto_meta.get('selected_slot'),
+            'today_focus_completed': auto_meta.get('today_completed'),
+            'today_focus_win_rate': auto_meta.get('today_win_rate'),
+            'today_focus_avg_profit_pct': auto_meta.get('today_avg_profit_pct')
+        },
+        'auto_meta': auto_meta,
+        'snapshot_id': snapshot_id,
+        'strategy_after': strategy_after
+    }
+    tuning_path = save_tuning_suggestion(tuning_record)
+    run_row = save_tuning_run(
+        target,
+        focus_code,
+        AUTO_FOCUS_TUNING_KIND,
+        payload={
+            'snapshot_id': snapshot_id,
+            'patch_summary': patch_summary,
+            'tuning_path': tuning_path,
+            'completed': completed,
+            'today_completed': today_completed,
+            'auto_meta': auto_meta
+        }
+    )
+
+    result = {
+        'applied': True,
+        'reason': 'applied',
+        'target_date': target,
+        'focus_code': focus_code,
+        'focus_name': focus_name,
+        'completed': completed,
+        'today_completed': today_completed,
+        'snapshot_id': snapshot_id,
+        'patch_summary': patch_summary,
+        'applied_patch': applied,
+        'saved_path': tuning_path,
+        'run_id': run_row.get('id') if isinstance(run_row, dict) else None,
+        'auto_meta': auto_meta
+    }
+    log_debug_event('focus_tuning_auto_applied', result, target_date=target)
+    return result
+
+def build_focus_guard_status_snapshot(target_date=None):
+    target = normalize_date_str(target_date, fallback_today=True)
+    if not target:
+        target = datetime.datetime.now().strftime('%Y-%m-%d')
+
+    now_ts = time.time()
+    with state_lock:
+        enabled = bool(success_rates.get('focus_guard_enabled', FOCUS_GUARD_ENABLED_DEFAULT))
+        min_samples = max(1, int(success_rates.get('auto_focus_tuning_min_samples', AUTO_FOCUS_TUNING_MIN_SAMPLES_DEFAULT) or AUTO_FOCUS_TUNING_MIN_SAMPLES_DEFAULT))
+        lookback_days = max(5, min(20, int(success_rates.get('regime_lookback_days', 7) or 7)))
+        fail_streak = dict(risk_state.get('focus_side_fail_streak', {}))
+
+    diagnostics = get_focus_guard_diagnostics(code=FOCUS_STOCK_CODE, end_date=target, lookback_days=lookback_days) if enabled else {}
+    focus = (diagnostics or {}).get('focus') or {}
+    completed = int(focus.get('completed', 0) or 0)
+    weak_sides = []
+    weak_slots = []
+
+    for side in ('BUY', 'SELL'):
+        side_metrics = (focus.get('by_type') or {}).get(side, {})
+        side_completed = int(side_metrics.get('completed', 0) or 0)
+        side_wr = float(side_metrics.get('win_rate', 0.0) or 0.0)
+        if side_completed >= 4 and side_wr < FOCUS_GUARD_SIDE_WR_FLOOR:
+            weak_sides.append({
+                'side': side,
+                'completed': side_completed,
+                'win_rate': round(side_wr, 2)
+            })
+
+    for item in (focus.get('slots') or []):
+        slot_completed = int(item.get('completed', 0) or 0)
+        slot_wr = float(item.get('win_rate', 0.0) or 0.0)
+        if slot_completed >= 3 and slot_wr < FOCUS_GUARD_SLOT_WR_FLOOR:
+            weak_slots.append({
+                'slot': item.get('slot'),
+                'label': item.get('label') or item.get('slot') or '--',
+                'completed': slot_completed,
+                'win_rate': round(slot_wr, 2)
+            })
+
+    cooldowns = {}
+    active_sides = []
+    for side in ('BUY', 'SELL'):
+        paused, left_sec, reason = is_focus_side_paused(FOCUS_STOCK_CODE, side, now_ts=now_ts)
+        cooldowns[side] = {
+            'paused': paused,
+            'left_sec': round(left_sec, 2),
+            'reason': reason,
+            'fail_streak': int(fail_streak.get(side, 0) or 0)
+        }
+        if paused:
+            active_sides.append(side)
+
+    stage = 'warming'
+    title = '样本积累中，先观察稳定性'
+    if not enabled:
+        stage = 'disabled'
+        title = '聚焦票实时防守已关闭'
+    elif active_sides:
+        stage = 'cooldown'
+        title = f"{' / '.join(active_sides)} 冷却中，系统暂时拦截该侧新信号"
+    elif completed < min_samples:
+        stage = 'warming'
+        title = f'真实样本 {completed} 笔，未达到防守门槛 {min_samples} 笔'
+    elif weak_sides or weak_slots:
+        stage = 'guarded'
+        title = '已识别弱侧/弱时段，系统会优先保护胜率'
+    else:
+        stage = 'normal'
+        title = '当前未发现明显弱侧，系统正常放行'
+
+    notes = []
+    for item in weak_sides[:2]:
+        notes.append(f"{item['side']} 胜率偏弱 {item['win_rate']:.1f}% ({item['completed']} 笔)")
+    for item in weak_slots[:2]:
+        notes.append(f"{item['label']} 偏弱 {item['win_rate']:.1f}% ({item['completed']} 笔)")
+
+    return {
+        'enabled': enabled,
+        'stage': stage,
+        'title': title,
+        'code': FOCUS_STOCK_CODE,
+        'name': FOCUS_STOCK_NAME,
+        'target_date': target,
+        'updated_at': datetime.datetime.now().isoformat(timespec='seconds'),
+        'lookback_days': lookback_days,
+        'min_samples': min_samples,
+        'completed': completed,
+        'win_rate': round(float(focus.get('win_rate', 0.0) or 0.0), 2),
+        'avg_profit_pct': round(float(focus.get('avg_profit_pct', 0.0) or 0.0), 4),
+        'by_type': copy.deepcopy(focus.get('by_type') or {}),
+        'cooldowns': cooldowns,
+        'weak_sides': weak_sides,
+        'weak_slots': weak_slots,
+        'notes': notes[:4]
+    }
+
+def get_focus_side_rejection_pressure(code, sig_type, target_date=None, limit=3000):
+    normalized_code = str(code or '').strip().lower()
+    side = str(sig_type or '').strip().upper()
+    meta = {
+        'active': normalized_code == FOCUS_STOCK_CODE and side in ('BUY', 'SELL'),
+        'code': FOCUS_STOCK_CODE,
+        'side': side,
+        'stage': 'idle',
+        'threshold_add': 0.0,
+        'accepted': 0,
+        'rejected': 0,
+        'total': 0,
+        'reject_rate': 0.0,
+        'recent_window': FOCUS_SIDE_PRESSURE_RECENT_DECISIONS,
+        'recent_accepted': 0,
+        'recent_rejected': 0,
+        'recent_total': 0,
+        'recent_reject_rate': 0.0,
+        'consecutive_rejected': 0,
+        'min_decisions': FOCUS_SIDE_PRESSURE_MIN_DECISIONS,
+        'title': ''
+    }
+    if not meta['active']:
+        return meta
+
+    snapshot = build_rejection_monitor_snapshot(target_date=target_date, limit=limit)
+    side_stats = copy.deepcopy(((snapshot or {}).get('focus_sides') or {}).get(side) or {})
+    if side_stats:
+        meta.update(side_stats)
+    meta['active'] = True
+    meta['code'] = FOCUS_STOCK_CODE
+    meta['side'] = side
+    return meta
+
+
+def build_rejection_monitor_snapshot(target_date=None, limit=3000):
+    target = normalize_date_str(target_date, fallback_today=True)
+    if not target:
+        target = datetime.datetime.now().strftime('%Y-%m-%d')
+    capped_limit = max(200, min(int(limit or 3000), 5000))
+    cache_key = (target, capped_limit, FOCUS_STOCK_CODE)
+    now_ts = time.time()
+
+    with state_lock:
+        cached = rejection_monitor_cache.get(cache_key)
+        if cached and now_ts - float(cached.get('ts', 0.0) or 0.0) <= REJECTION_MONITOR_CACHE_TTL_SEC:
+            return copy.deepcopy(cached.get('value') or {})
+
+    entries = read_debug_log_entries(target, limit=capped_limit)
+    summary = summarize_debug_entries(entries)
+    focus_entries = [e for e in entries if str(e.get('code') or '').strip().lower() == FOCUS_STOCK_CODE]
+    focus_summary = summarize_debug_entries(focus_entries)
+    focus_decisions = [
+        e for e in focus_entries
+        if str(e.get('event') or '') in ('signal_accepted', 'signal_rejected')
+        and str(e.get('signal_type') or '').strip().upper() in ('BUY', 'SELL')
+    ]
+
+    def top_items(counter_dict, topn=5):
+        items = sorted((counter_dict or {}).items(), key=lambda x: (-int(x[1]), str(x[0])))[:topn]
+        return [{'reason': str(name), 'count': int(count)} for name, count in items]
+
+    def stage_rank(stage_name):
+        return {'idle': 0, 'normal': 1, 'watch': 2, 'hot': 3}.get(str(stage_name or ''), 0)
+
+    def build_side_stats(side_name):
+        side_events = [e for e in focus_decisions if str(e.get('signal_type') or '').strip().upper() == side_name]
+        accepted = sum(1 for e in side_events if str(e.get('event') or '') == 'signal_accepted')
+        rejected = sum(1 for e in side_events if str(e.get('event') or '') == 'signal_rejected')
+        total = accepted + rejected
+        reject_rate = rejected * 100.0 / total if total > 0 else 0.0
+        recent_events = side_events[-FOCUS_SIDE_PRESSURE_RECENT_DECISIONS:]
+        recent_accepted = sum(1 for e in recent_events if str(e.get('event') or '') == 'signal_accepted')
+        recent_rejected = sum(1 for e in recent_events if str(e.get('event') or '') == 'signal_rejected')
+        recent_total = recent_accepted + recent_rejected
+        recent_reject_rate = recent_rejected * 100.0 / recent_total if recent_total > 0 else 0.0
+
+        consecutive_rejected = 0
+        for entry in reversed(side_events):
+            if str(entry.get('event') or '') == 'signal_rejected':
+                consecutive_rejected += 1
+            elif str(entry.get('event') or '') == 'signal_accepted':
+                break
+
+        stage = 'idle'
+        threshold_add = 0.0
+        title = f'{side_name} 暂无方向压力'
+        if total > 0:
+            stage = 'normal'
+            title = f'{side_name} 当前过滤节奏正常'
+
+        hot_trigger = (
+            (recent_total >= FOCUS_SIDE_PRESSURE_MIN_DECISIONS and recent_reject_rate >= FOCUS_SIDE_PRESSURE_HOT_REJECT_RATE)
+            or (total >= max(3, FOCUS_SIDE_PRESSURE_MIN_DECISIONS) and reject_rate >= FOCUS_SIDE_PRESSURE_HOT_REJECT_RATE)
+            or consecutive_rejected >= FOCUS_SIDE_PRESSURE_HOT_STREAK
+        )
+        watch_trigger = (
+            (recent_total >= FOCUS_SIDE_PRESSURE_MIN_DECISIONS and recent_reject_rate >= FOCUS_SIDE_PRESSURE_WATCH_REJECT_RATE)
+            or (total >= FOCUS_SIDE_PRESSURE_MIN_DECISIONS and reject_rate >= FOCUS_SIDE_PRESSURE_WATCH_REJECT_RATE)
+            or consecutive_rejected >= FOCUS_SIDE_PRESSURE_WATCH_STREAK
+        )
+
+        if hot_trigger:
+            stage = 'hot'
+            threshold_add = FOCUS_SIDE_PRESSURE_HOT_DELTA
+            title = f'{side_name} 方向拒绝率过高，系统已自动收紧阈值'
+        elif watch_trigger:
+            stage = 'watch'
+            threshold_add = FOCUS_SIDE_PRESSURE_WATCH_DELTA
+            title = f'{side_name} 方向拒绝率抬升，系统已轻度收紧阈值'
+
+        return {
+            'side': side_name,
+            'accepted': int(accepted),
+            'rejected': int(rejected),
+            'total': int(total),
+            'reject_rate': round(reject_rate, 2),
+            'recent_window': FOCUS_SIDE_PRESSURE_RECENT_DECISIONS,
+            'recent_accepted': int(recent_accepted),
+            'recent_rejected': int(recent_rejected),
+            'recent_total': int(recent_total),
+            'recent_reject_rate': round(recent_reject_rate, 2),
+            'consecutive_rejected': int(consecutive_rejected),
+            'min_decisions': FOCUS_SIDE_PRESSURE_MIN_DECISIONS,
+            'stage': stage,
+            'threshold_add': round(float(threshold_add), 4),
+            'title': title
+        }
+
+    overall_rejected = int(summary.get('event_counts', {}).get('signal_rejected', 0))
+    overall_accepted = int(summary.get('event_counts', {}).get('signal_accepted', 0))
+    focus_rejected = int(focus_summary.get('event_counts', {}).get('signal_rejected', 0))
+    focus_accepted = int(focus_summary.get('event_counts', {}).get('signal_accepted', 0))
+    focus_by_type = focus_summary.get('by_type', {}) or {}
+    focus_sides = {side: build_side_stats(side) for side in ('BUY', 'SELL')}
+    pressure_alerts = []
+    for side_name in ('BUY', 'SELL'):
+        stats = focus_sides.get(side_name) or {}
+        if stage_rank(stats.get('stage')) < stage_rank('watch'):
+            continue
+        pressure_alerts.append({
+            'side': side_name,
+            'stage': stats.get('stage'),
+            'title': stats.get('title'),
+            'threshold_add': float(stats.get('threshold_add', 0.0) or 0.0),
+            'reject_rate': float(stats.get('reject_rate', 0.0) or 0.0),
+            'recent_reject_rate': float(stats.get('recent_reject_rate', 0.0) or 0.0),
+            'recent_total': int(stats.get('recent_total', 0) or 0),
+            'consecutive_rejected': int(stats.get('consecutive_rejected', 0) or 0)
+        })
+
+    stage = 'idle'
+    title = '今日暂未出现明显拒绝堆积'
+    if any(stage_rank((focus_sides.get(side) or {}).get('stage')) >= stage_rank('hot') for side in ('BUY', 'SELL')):
+        stage = 'hot'
+        title = '焦点票单侧拒绝率过高，系统已自动收紧阈值'
+    elif any(stage_rank((focus_sides.get(side) or {}).get('stage')) >= stage_rank('watch') for side in ('BUY', 'SELL')):
+        stage = 'watch'
+        title = '焦点票单侧拒绝率抬升，建议优先关注该方向'
+    elif focus_rejected >= 8:
+        stage = 'hot'
+        title = '焦点票拒绝堆积明显，建议优先看拦截原因'
+    elif focus_rejected >= 3:
+        stage = 'watch'
+        title = '焦点票出现多次拦截，建议关注过滤原因'
+    elif overall_rejected > 0:
+        stage = 'normal'
+        title = '系统正在过滤低质量信号'
+
+    notes = []
+    for alert in pressure_alerts[:2]:
+        notes.append(
+            f"{alert['side']} 近{alert['recent_total']}笔拒绝率 {alert['recent_reject_rate']:.1f}% · 阈值+{alert['threshold_add']:.2f}"
+        )
+    for item in top_items(focus_summary.get('reject_reasons', {}), topn=3):
+        notes.append(f"{item['reason']} × {item['count']}")
+
+    value = {
+        'date': target,
+        'updated_at': datetime.datetime.now().isoformat(timespec='seconds'),
+        'focus_code': FOCUS_STOCK_CODE,
+        'focus_name': FOCUS_STOCK_NAME,
+        'stage': stage,
+        'title': title,
+        'sample_size': int(summary.get('sample_size', 0) or 0),
+        'overall': {
+            'accepted': overall_accepted,
+            'rejected': overall_rejected,
+            'top_reasons': top_items(summary.get('reject_reasons', {}), topn=5),
+            'by_type': copy.deepcopy(summary.get('by_type', {}) or {})
+        },
+        'focus': {
+            'accepted': focus_accepted,
+            'rejected': focus_rejected,
+            'top_reasons': top_items(focus_summary.get('reject_reasons', {}), topn=5),
+            'by_type': copy.deepcopy(focus_by_type),
+            'buy_rejected': int((focus_by_type.get('BUY', {}) or {}).get('rejected', 0) or 0),
+            'sell_rejected': int((focus_by_type.get('SELL', {}) or {}).get('rejected', 0) or 0)
+        },
+        'focus_sides': focus_sides,
+        'pressure_alerts': pressure_alerts,
+        'notes': notes
+    }
+
+    with state_lock:
+        rejection_monitor_cache[cache_key] = {
+            'ts': now_ts,
+            'value': copy.deepcopy(value)
+        }
+    return value
+
+def build_focus_review_snapshot(target_date=None, recent_limit=6):
+    target = normalize_date_str(target_date, fallback_today=True)
+    if not target:
+        target = datetime.datetime.now().strftime('%Y-%m-%d')
+
+    with state_lock:
+        lookback_days = max(5, min(20, int(success_rates.get('regime_lookback_days', 7) or 7)))
+    diagnostics = compute_edge_diagnostics(days=lookback_days, end_date=target, focus_code=FOCUS_STOCK_CODE)
+    focus = (diagnostics or {}).get('focus') or {}
+    date_range = (diagnostics or {}).get('date_range') or {}
+    focus_name = str(focus.get('name') or FOCUS_STOCK_NAME)
+
+    end_dt = datetime.datetime.strptime(target, '%Y-%m-%d').date()
+    start_dt = end_dt - datetime.timedelta(days=max(1, lookback_days) - 1)
+    rows = get_signal_rows(date_from=start_dt.strftime('%Y-%m-%d'), date_to=target)
+    recent_resolved = []
+    for row in rows:
+        if str(row.get('code') or '').strip().lower() != FOCUS_STOCK_CODE:
+            continue
+        status = str(row.get('status') or '').strip().lower()
+        if status not in ('success', 'fail'):
+            continue
+        slot_name = get_time_slot_label(row.get('time'))
+        recent_resolved.append({
+            'date': str(row.get('date') or ''),
+            'time': str(row.get('time') or ''),
+            'type': str(row.get('type') or ''),
+            'status': status,
+            'profit_pct': round(float(row.get('profit_pct') or 0.0), 4),
+            'slot': slot_name,
+            'slot_label': DIAG_SLOT_LABELS.get(slot_name, slot_name)
+        })
+    recent_resolved = list(reversed(recent_resolved[-max(1, int(recent_limit or 6)):]))
+
+    completed = int(focus.get('completed', 0) or 0)
+    win_rate = round(float(focus.get('win_rate', 0.0) or 0.0), 2)
+    avg_profit_pct = round(float(focus.get('avg_profit_pct', 0.0) or 0.0), 4)
+    strengths = list(focus.get('strengths') or [])[:3]
+    risks = list(focus.get('risks') or [])[:4]
+
+    stage = 'warming'
+    title = '焦点复盘样本仍在积累中'
+    if completed >= 4 and risks:
+        stage = 'watch'
+        title = '焦点票存在可复盘弱点，建议优先修正弱侧'
+    elif completed >= 6 and strengths and avg_profit_pct > 0:
+        stage = 'strong'
+        title = '焦点票近期结构较稳，可继续小步优化'
+    elif completed >= 4:
+        stage = 'normal'
+        title = '焦点票表现中性，继续跟踪方向与时段变化'
+
+    return {
+        'date': target,
+        'updated_at': datetime.datetime.now().isoformat(timespec='seconds'),
+        'title': title,
+        'stage': stage,
+        'code': FOCUS_STOCK_CODE,
+        'name': focus_name,
+        'lookback_days': int(date_range.get('days', lookback_days) or lookback_days),
+        'completed': completed,
+        'win_rate': win_rate,
+        'avg_profit_pct': avg_profit_pct,
+        'by_type': copy.deepcopy(focus.get('by_type') or {}),
+        'best_slot': copy.deepcopy(focus.get('best_slot') or {}),
+        'worst_slot': copy.deepcopy(focus.get('worst_slot') or {}),
+        'strengths': strengths,
+        'risks': risks,
+        'recent_resolved': recent_resolved
+    }
 
 
 def build_slot_hints(slot_perf):
@@ -4915,6 +6024,12 @@ def maybe_auto_generate_daily_report():
         )
     except Exception as e:
         log_debug_event('tuning_suggested_auto_failed', {'date': target_date, 'error': str(e)}, target_date=target_date)
+    try:
+        auto_focus_result = maybe_auto_apply_focus_tuning(target_date)
+        if not auto_focus_result.get('applied') and auto_focus_result.get('reason') != 'already_applied':
+            log_debug_event('focus_tuning_auto_skipped', auto_focus_result, target_date=target_date)
+    except Exception as e:
+        log_debug_event('focus_tuning_auto_failed', {'date': target_date, 'error': str(e)}, target_date=target_date)
     try:
         generate_daily_bundle(target_date, trigger='auto_after_close')
     except Exception as e:

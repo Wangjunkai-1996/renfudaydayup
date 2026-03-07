@@ -10,6 +10,9 @@ HOOK_LOG="${HOOK_LOG:-/tmp/renfu-pre-push.log}"
 HOOK_STATE_DIR="${HOOK_STATE_DIR:-/tmp/renfu-pre-push.state.d}"
 LATEST_TARGET_FILE="${LATEST_TARGET_FILE:-${HOOK_STATE_DIR}/latest_target}"
 DEPLOY_DEBOUNCE_SEC="${DEPLOY_DEBOUNCE_SEC:-8}"
+REMOTE_CHECK_TIMEOUT_SEC="${REMOTE_CHECK_TIMEOUT_SEC:-5}"
+REMOTE_CHECK_MAX_ATTEMPTS="${REMOTE_CHECK_MAX_ATTEMPTS:-45}"
+REMOTE_CHECK_INTERVAL_SEC="${REMOTE_CHECK_INTERVAL_SEC:-1}"
 
 remote_name="${1:-}"
 target_ref="refs/heads/${DEPLOY_BRANCH}"
@@ -45,6 +48,7 @@ fi
 
 ensure_state_dir
 write_latest_target "${expected_sha}"
+touch "${HOOK_LOG}"
 
 if [[ ! -x "${DEPLOY_SCRIPT}" ]]; then
   {
@@ -70,7 +74,10 @@ nohup env \
   HOOK_LOG="${HOOK_LOG}" \
   LATEST_TARGET_FILE="${LATEST_TARGET_FILE}" \
   DEPLOY_DEBOUNCE_SEC="${DEPLOY_DEBOUNCE_SEC}" \
+  REMOTE_CHECK_TIMEOUT_SEC="${REMOTE_CHECK_TIMEOUT_SEC}" \
+  REMOTE_CHECK_MAX_ATTEMPTS="${REMOTE_CHECK_MAX_ATTEMPTS}" \
+  REMOTE_CHECK_INTERVAL_SEC="${REMOTE_CHECK_INTERVAL_SEC}" \
   EXPECTED_SHA="${expected_sha}" \
-  "${DEPLOY_RUNNER}" >/dev/null 2>&1 &
+  "${DEPLOY_RUNNER}" </dev/null >> "${HOOK_LOG}" 2>&1 &
 
 exit 0

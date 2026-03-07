@@ -185,10 +185,14 @@
                     </div>
 
                     <div class="bg-slate-800/90 rounded-xl border border-slate-700 p-4 shadow-lg">
-                        <div class="flex items-center justify-between mb-3">
+                        <div class="flex items-center justify-between gap-2 mb-3">
                             <h3 class="text-sm font-semibold text-slate-200">胜率诊断</h3>
-                            <span id="diag-range"
-                                class="text-[10px] px-2 py-1 rounded border border-slate-600 text-slate-400">--</span>
+                            <div class="flex items-center gap-2">
+                                <button id="diag-apply-btn" onclick="applyEdgeDiagnosticsPatch()" disabled
+                                    class="px-2 py-1 text-[10px] rounded border border-slate-600 text-slate-500 bg-slate-800/60 cursor-not-allowed transition">应用建议</button>
+                                <span id="diag-range"
+                                    class="text-[10px] px-2 py-1 rounded border border-slate-600 text-slate-400">--</span>
+                            </div>
                         </div>
                         <div class="grid grid-cols-4 gap-2 mb-3 text-[11px]">
                             <div class="bg-slate-900/70 rounded p-2 border border-slate-700/50">
@@ -214,6 +218,7 @@
                         </div>
                         <div id="diag-suggestions" class="mt-3 space-y-1 text-[11px]"></div>
                         <div id="diag-patch" class="mt-3 space-y-1 text-[11px]"></div>
+                        <div id="diag-apply-status" class="mt-2 text-[10px] text-slate-500">调参建议仅作用于当前运行实例，并会保存参数快照。</div>
                     </div>
                 </div>
 
@@ -341,6 +346,8 @@
         let targetLoss = 0.008;
         let strategyPanelLastFetchTs = 0;
         let strategyPanelLoading = false;
+        let lastEdgeDiagnostics = null;
+        let edgeDiagApplying = false;
         let preCloseNotifiedSignals = new Set();
         let lastPreCloseStage = '';
         let baseConfigDirty = false;
@@ -1293,7 +1300,114 @@
         }
 
 
+        function hasMeaningfulPatch(value) {
+            if (!value || typeof value !== 'object') return false;
+            if (Array.isArray(value)) return value.length > 0;
+            return Object.values(value).some(item => {
+                if (item && typeof item === 'object') return hasMeaningfulPatch(item);
+                return item !== undefined && item !== null;
+            });
+        }
+
+        function updateDiagApplyUi({ canApply = false, loading = false, status = '', tone = 'muted' } = {}) {
+            const btn = document.getElementById('diag-apply-btn');
+            const statusEl = document.getElementById('diag-apply-status');
+            if (btn) {
+                btn.disabled = !canApply || loading;
+                if (loading) {
+                    btn.className = 'px-2 py-1 text-[10px] rounded border border-amber-500/40 text-amber-200 bg-amber-500/10 cursor-wait transition';
+                    btn.innerText = '应用中...';
+                } else if (canApply) {
+                    btn.className = 'px-2 py-1 text-[10px] rounded border border-cyan-500/40 text-cyan-200 bg-cyan-500/10 hover:bg-cyan-500/20 transition';
+                    btn.innerText = '应用建议';
+                } else {
+                    btn.className = 'px-2 py-1 text-[10px] rounded border border-slate-600 text-slate-500 bg-slate-800/60 cursor-not-allowed transition';
+                    btn.innerText = '暂无动作';
+                }
+            }
+            if (statusEl) {
+                const toneClass = tone === 'success'
+                    ? 'text-emerald-300'
+                    : (tone === 'error' ? 'text-rose-300' : (tone === 'info' ? 'text-amber-300' : 'text-slate-500'));
+                statusEl.className = `mt-2 text-[10px] ${toneClass}`;
+                statusEl.innerText = status || '';
+            }
+        }
+
+        async function applyEdgeDiagnosticsPatch() {
+            if (edgeDiagApplying) return;
+
+            const diagnostics = lastEdgeDiagnostics || {};
+            const patch = (diagnostics || {}).proposed_patch || {};
+            if (!hasMeaningfulPatch(patch)) {
+                alert('当前暂无可应用的诊断建议');
+                return;
+            }
+
+            const focus = (diagnostics || {}).focus || {};
+            const focusName = focus.name || viewState.focus_stock_name || '聚焦标的';
+            const focusCode = focus.code || viewState.focus_stock_code || '';
+            const targetDate = (((diagnostics || {}).date_range || {}).to || '').trim();
+            const patchSummary = ((diagnostics || {}).patch_summary || []).slice(0, 3);
+            const summaryText = patchSummary.length ? `\n- ${patchSummary.join('\n- ')}` : '';
+            const focusText = focusCode ? `${focusName} ${focusCode}` : focusName;
+
+            if (!confirm(`确认将胜率诊断建议应用到当前运行策略吗？\n\n标的：${focusText}${summaryText}\n\n系统会自动保存一份参数快照。`)) {
+                return;
+            }
+
+            edgeDiagApplying = true;
+            updateDiagApplyUi({
+                canApply: false,
+                loading: true,
+                status: '正在应用诊断建议并保存参数快照...',
+                tone: 'info'
+            });
+
+            try {
+                const response = await apiFetch('/api/tuning/apply', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        date: targetDate || undefined,
+                        patch,
+                        save_snapshot: true,
+                        note: `edge_diagnostics_apply ${focusCode || focusName} ${targetDate || ''}`.trim()
+                    })
+                });
+                const data = await response.json();
+                if (!response.ok || !data || !data.success) {
+                    const msg = (data && data.msg) || '应用诊断建议失败';
+                    edgeDiagApplying = false;
+                    updateDiagApplyUi({ canApply: true, loading: false, status: msg, tone: 'error' });
+                    alert(msg);
+                    return;
+                }
+
+                strategyPanelLastFetchTs = 0;
+                await fetchStrategyPanels(true);
+
+                edgeDiagApplying = false;
+                const latestPatch = ((lastEdgeDiagnostics || {}).proposed_patch || {});
+                const latestSummary = ((lastEdgeDiagnostics || {}).patch_summary || []);
+                const canApplyAgain = hasMeaningfulPatch(latestPatch) && latestSummary.length > 0;
+                const snapshotText = data.snapshot_id ? `，快照 #${data.snapshot_id}` : '';
+                updateDiagApplyUi({
+                    canApply: canApplyAgain,
+                    loading: false,
+                    status: `诊断建议已应用${snapshotText}${canApplyAgain ? '，面板已刷新，请复核最新建议。' : '，当前已无待应用动作。'}`,
+                    tone: 'success'
+                });
+            } catch (error) {
+                edgeDiagApplying = false;
+                console.error('apply edge diagnostics error:', error);
+                updateDiagApplyUi({ canApply: true, loading: false, status: '应用诊断建议失败，请稍后重试', tone: 'error' });
+                alert('应用诊断建议失败');
+            }
+        }
+
         function renderEdgeDiagnostics(diagnostics) {
+            lastEdgeDiagnostics = diagnostics || null;
             const rangeEl = document.getElementById('diag-range');
             const focusEl = document.getElementById('diag-focus');
             const completedEl = document.getElementById('diag-completed');
@@ -1360,6 +1474,18 @@
                 patchEl.innerHTML = '<div class="text-slate-500">当前暂无建议直接落地的调参动作</div>';
             } else {
                 patchEl.innerHTML = patchSummary.slice(0, 4).map(line => `<div class="px-2 py-1 rounded border border-cyan-500/30 bg-cyan-500/10 text-cyan-200">${escapeHtml(line)}</div>`).join('');
+            }
+
+            if (!edgeDiagApplying) {
+                const canApply = hasMeaningfulPatch((diagnostics || {}).proposed_patch || {}) && patchSummary.length > 0;
+                updateDiagApplyUi({
+                    canApply,
+                    loading: false,
+                    status: canApply
+                        ? '可一键应用到当前运行策略，并自动保存参数快照。'
+                        : '当前暂无可直接应用的调参动作。',
+                    tone: 'muted'
+                });
             }
         }
 

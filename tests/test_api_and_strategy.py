@@ -403,3 +403,53 @@ def test_edge_diagnostics_endpoint_returns_focus_patch(load_app):
     patch = diagnostics['proposed_patch']['stock_strategies']['sz002438']
     assert patch['buy_min_score'] > 0.6
     assert patch['signal_profile']['signal_threshold'] >= 0.6
+
+
+def test_tuning_apply_accepts_edge_diagnostics_patch(load_app):
+    app_module = load_app()
+    conn = app_module.get_db()
+    rows = [
+        ('b1', '2026-03-07', '09:35:00', 1, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.8),
+        ('b2', '2026-03-07', '09:48:00', 2, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.5),
+        ('b3', '2026-03-07', '10:12:00', 3, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'success', 0.6),
+        ('b4', '2026-03-07', '13:08:00', 4, 'sz002438', '江苏神通', 'BUY', 1, 10.0, 'd', 'fail', -0.4),
+        ('b5', '2026-03-07', '13:42:00', 5, 'sz002438', '江苏神通', 'SELL', 1, 10.0, 'd', 'success', 0.7),
+        ('b6', '2026-03-07', '14:36:00', 6, 'sz002438', '江苏神通', 'SELL', 1, 10.0, 'd', 'success', 0.5),
+    ]
+    conn.executemany(
+        """
+        INSERT INTO signals (id, date, time, seq_no, code, name, type, level, price, desc, status, profit_pct)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows
+    )
+    conn.commit()
+    conn.close()
+
+    client = app_module.app.test_client()
+    diag_resp = client.get('/api/analytics/edge-diagnostics?days=10&focus=sz002438&date=2026-03-07')
+    assert diag_resp.status_code == 200
+    diagnostics = diag_resp.get_json()['diagnostics']
+    patch = diagnostics['proposed_patch']
+
+    apply_resp = client.post(
+        '/api/tuning/apply',
+        json={
+            'date': '2026-03-07',
+            'patch': patch,
+            'note': 'edge diagnostics apply'
+        }
+    )
+
+    assert apply_resp.status_code == 200
+    payload = apply_resp.get_json()
+    assert payload['success'] is True
+    assert payload['snapshot_id'] is not None
+    applied_stock = payload['applied']['stock_strategies']['sz002438']
+    patch_stock = patch['stock_strategies']['sz002438']
+    assert applied_stock['buy_min_score'] == patch_stock['buy_min_score']
+    assert applied_stock['signal_profile']['signal_threshold'] == patch_stock['signal_profile']['signal_threshold']
+
+    strategy_after = payload['strategy_after']['stock_strategies']['sz002438']
+    assert strategy_after['buy_min_score'] == patch_stock['buy_min_score']
+    assert strategy_after['signal_profile']['signal_threshold'] == patch_stock['signal_profile']['signal_threshold']

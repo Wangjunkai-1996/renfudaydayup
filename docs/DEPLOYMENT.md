@@ -5,7 +5,7 @@
 - Git push hook lives in `.githooks/pre-push` and is versioned with the repository.
 - The hook triggers only when pushing `origin/master` by default.
 - Each matching push updates a local “latest target” state file, and only the newest target is deployed.
-- After the remote branch reaches the pushed commit SHA, the hook waits briefly, then runs `scripts/deploy_server.sh` in the background.
+- After the remote branch reaches the pushed commit SHA, the hook waits briefly, then starts `scripts/run_deploy_after_push.sh` with `nohup`, which calls `scripts/deploy_server.sh` in the background.
 - Hook logs are written to `/tmp/renfu-pre-push.log`.
 
 ## One-Time Setup
@@ -29,7 +29,7 @@ You can deploy manually at any time:
 ## Deploy Script Behavior
 
 - Syncs code to `${SERVER_USER}@${SERVER_HOST}:${SERVER_APP_DIR}` with `rsync`
-- Excludes `.git/`, `.githooks/`, `.venv/`, and `data/`
+- Excludes `.git/`, `.githooks/`, `.venv/`, `.pytest_cache/`, `__pycache__/`, and `data/`
 - Collapses rapid consecutive pushes so only the latest queued commit is deployed
 - Creates or reuses server-side `.venv`
 - Installs dependencies from `requirements.txt`

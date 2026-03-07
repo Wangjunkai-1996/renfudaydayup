@@ -141,6 +141,8 @@ main() {
     --exclude ".git" \
     --exclude ".githooks" \
     --exclude ".venv" \
+    --exclude ".pytest_cache" \
+    --exclude "__pycache__" \
     --exclude "data/" \
     -e "ssh -o StrictHostKeyChecking=accept-new" \
     "${ROOT_DIR}/" "${SERVER_USER}@${SERVER_HOST}:${SERVER_APP_DIR}/"

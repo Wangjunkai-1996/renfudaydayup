@@ -27,6 +27,94 @@ def test_parse_since_ts_arg_supports_seconds_and_milliseconds(load_app):
     assert app_module.parse_since_ts_arg('not-a-number') is None
 
 
+def test_default_focus_stock_and_limit(load_app):
+    app_module = load_app()
+    assert app_module.FOCUS_STOCK_CODE == 'sz002438'
+    assert app_module.FOCUS_STOCK_NAME == '江苏神通'
+    assert app_module.MAX_STOCKS == 3
+    assert app_module.DEFAULT_WATCHLIST == ['sz002438']
+
+
+def test_apply_add_stock_rejects_when_already_at_three(load_app):
+    app_module = load_app()
+    with app_module.state_lock:
+        app_module.active_stocks.clear()
+        app_module.active_stocks['sz002438'] = '江苏神通'
+        app_module.active_stocks['sh600079'] = '人福医药'
+        app_module.active_stocks['sz300402'] = '宝色股份'
+
+    ok, msg = app_module.apply_add_stock('sz000001')
+    assert ok is False
+    assert '最多只能监控 3 只股票' in msg
+
+
+def test_each_stock_can_have_dedicated_strategy_patch(load_app):
+    app_module = load_app()
+
+    class DummyAnalyzer:
+        def __init__(self):
+            self.profile = {}
+
+    with app_module.state_lock:
+        app_module.analyzers['sz002438'] = DummyAnalyzer()
+
+    ok, errors, applied = app_module.apply_strategy_patch({
+        'stock_strategies': {
+            'sz002438': {
+                'buy_min_score': 0.71,
+                'trade_cost_buffer': 0.0030,
+                'time_slot_templates': {
+                    'open': {'buy_min_score': 0.73}
+                },
+                'signal_profile': {
+                    'name': 'jsst_custom_v1',
+                    'signal_threshold': 0.61,
+                    'edge_min': 0.19
+                }
+            }
+        }
+    })
+
+    assert ok is True
+    assert errors == {}
+    assert applied['stock_strategies']['sz002438']['buy_min_score'] == 0.71
+
+    snapshot = app_module.get_strategy_snapshot()
+    stock_cfg = snapshot['stock_strategies']['sz002438']
+    assert stock_cfg['buy_min_score'] == 0.71
+    assert stock_cfg['signal_profile']['name'] == 'jsst_custom_v1'
+
+    effective_open = app_module.get_effective_strategy('09:35:00', code='sz002438')
+    effective_morning = app_module.get_effective_strategy('10:05:00', code='sz002438')
+    assert effective_open['buy_min_score'] == 0.73
+    assert effective_morning['buy_min_score'] == 0.73
+    assert effective_morning['trade_cost_buffer'] == 0.003
+
+    gross, net, final = app_module.classify_trade_result('BUY', 100.0, 100.2, code='sz002438')
+    assert round(gross, 6) == 0.002
+    assert round(net, 6) == -0.001
+    assert final == 'fail'
+
+    profile = app_module.get_stock_signal_profile('sz002438')
+    assert profile['signal_threshold'] == 0.61
+    assert profile['edge_min'] == 0.19
+    assert app_module.analyzers['sz002438'].profile['signal_threshold'] == 0.61
+
+
+def test_new_stock_gets_dedicated_strategy_record(load_app):
+    app_module = load_app()
+
+    cfg = app_module.ensure_stock_strategy('sz000001')
+
+    assert isinstance(cfg, dict)
+    assert isinstance(cfg.get('time_slot_templates'), dict)
+    assert isinstance(cfg.get('signal_profile'), dict)
+    assert cfg['signal_profile']['name']
+
+    snapshot = app_module.get_strategy_snapshot()
+    assert 'sz000001' in snapshot['stock_strategies']
+
+
 def test_api_data_full_and_delta_sync(load_app):
     app_module = load_app()
     _prime_market_state(app_module)
@@ -203,6 +291,21 @@ def test_report_route_group_still_serves_debug_and_daily_endpoints(load_app):
     daily_payload = daily_resp.get_json()
     assert 'report' in daily_payload
     assert 'json_path' in daily_payload
+
+
+def test_remove_focus_stock_is_blocked(load_app):
+    app_module = load_app()
+    with app_module.state_lock:
+        app_module.active_stocks.clear()
+        app_module.active_stocks[app_module.FOCUS_STOCK_CODE] = app_module.FOCUS_STOCK_NAME
+
+    client = app_module.app.test_client()
+    resp = client.delete(f'/api/stocks/{app_module.FOCUS_STOCK_CODE}')
+    payload = resp.get_json()
+
+    assert resp.status_code == 400
+    assert payload.get('success') is False
+    assert '固定首票' in (payload.get('msg') or '')
 
 
 def test_history_endpoint_supports_code_and_status_filters(load_app):

@@ -36,6 +36,7 @@ Validation behavior:
 
 - Write APIs under `/api/` still use token guard from `app.py` middleware.
 - Existing payload fields for `/api/history` are kept (`signals`, `daily_stats`, `date_stats`) and now include `success` and `query` metadata.
+- `/api/config` now supports `stock_strategies` nested patches, so each stock can carry its own `time_slot_templates` and `signal_profile` plus per-stock threshold overrides.
 - Shared helper modules:
   - `renfu/request_args.py` for query parsing (`int` clamp and `since_ts` parse).
   - `renfu/history_service.py` for history SQL assembly and payload shape.

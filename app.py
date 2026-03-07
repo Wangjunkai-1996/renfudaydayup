@@ -55,8 +55,10 @@ def _env_bool(name, default='0'):
     return str(os.getenv(name, default)).strip().lower() in ('1', 'true', 'yes', 'on')
 
 HEADERS = {'Referer': 'http://finance.sina.com.cn'}
-DEFAULT_FOCUS_STOCK_CODE = 'sz300402'
+DEFAULT_FOCUS_STOCK_CODE = 'sz002438'
+DEFAULT_TEMPLATE_STOCK_CODE = 'sz300402'
 FOCUS_STOCK_NAME_MAP = {
+    'sz002438': '江苏神通',
     'sz300402': '宝色股份',
     'sh600079': '人福医药'
 }
@@ -74,13 +76,12 @@ STOCK_CONTEXT_RULES = {
         'hot_keywords': ['芬太尼']
     }
 }
-SINGLE_STOCK_MODE = _env_bool('RENFU_SINGLE_STOCK_MODE', '1')
-MAX_STOCKS = 1 if SINGLE_STOCK_MODE else 3
+MAX_STOCKS = 3
 MARKET_CLOSE_MINUTE = 15 * 60
 PRE_CLOSE_FLATTEN_MINUTE = 14 * 60 + 57
 PRE_CLOSE_WARN_MINUTE = 14 * 60 + 50
 PAPER_START_CASH = 800000.0
-DEFAULT_WATCHLIST = [FOCUS_STOCK_CODE] if SINGLE_STOCK_MODE else [FOCUS_STOCK_CODE, 'sh688563']
+DEFAULT_WATCHLIST = [FOCUS_STOCK_CODE]
 API_AUTH_TOKEN = str(os.getenv('API_AUTH_TOKEN', '')).strip()
 API_WRITE_METHODS = {'POST', 'PUT', 'PATCH', 'DELETE'}
 TRADE_CAL_REFRESH_SEC = 6 * 60 * 60
@@ -204,7 +205,7 @@ TIME_SLOT_TEMPLATES_BY_CODE = {
     }
 }
 DEFAULT_TIME_SLOT_TEMPLATES = copy.deepcopy(
-    TIME_SLOT_TEMPLATES_BY_CODE.get(FOCUS_STOCK_CODE, TIME_SLOT_TEMPLATES_BY_CODE[DEFAULT_FOCUS_STOCK_CODE])
+    TIME_SLOT_TEMPLATES_BY_CODE.get(FOCUS_STOCK_CODE, TIME_SLOT_TEMPLATES_BY_CODE[DEFAULT_TEMPLATE_STOCK_CODE])
 )
 
 _DEFAULT_OPEN_SLOT = DEFAULT_TIME_SLOT_TEMPLATES.get('open', {}) if isinstance(DEFAULT_TIME_SLOT_TEMPLATES, dict) else {}
@@ -221,6 +222,44 @@ UNIT_INTERVAL_FLOAT_KEYS = {
     'paper_slippage_pct', 'paper_commission_rate', 'paper_sell_stamp_tax'
 }
 
+GLOBAL_STRATEGY_SNAPSHOT_KEYS = STRATEGY_FLOAT_KEYS + STRATEGY_INT_KEYS + STRATEGY_BOOL_KEYS
+
+STOCK_STRATEGY_FLOAT_KEYS = (
+    'win_threshold', 'loss_threshold',
+    'buy_min_score', 'sell_min_score', 'buy_pause_min_wr',
+    'regime_target_wr', 'trade_cost_buffer'
+)
+STOCK_STRATEGY_INT_KEYS = (
+    'buy_pause_window', 'buy_pause_min_samples',
+    'regime_lookback_days', 'regime_min_samples', 'regime_slot_min_samples'
+)
+STOCK_STRATEGY_BOOL_KEYS = (
+    'buy_require_confirmation', 'buy_reject_bearish_tape',
+    'buy_auto_pause', 'close_pending_after_market',
+    'time_slot_enabled',
+    'risk_block_open_slot', 'risk_block_close_slot',
+    'regime_filter_enabled', 'regime_require_trend_alignment',
+    'regime_block_open_close'
+)
+
+SIGNAL_PROFILE_INT_KEYS = (
+    'min_points',
+    'same_dir_lock_sec', 'reverse_lock_sec'
+)
+SIGNAL_PROFILE_FLOAT_KEYS = (
+    'min_intraday_range', 'vwap_extreme_dev', 'vwap_bias_dev',
+    'obi_strong', 'vol_spike_ratio', 'signal_threshold', 'edge_min',
+    'same_dir_price_step', 'reverse_min_move',
+    'gap_reversal_weight', 'open_range_break_pct'
+)
+SIGNAL_PROFILE_STR_KEYS = ('name',)
+SIGNAL_PROFILE_UNIT_INTERVAL_FLOAT_KEYS = {
+    'min_intraday_range', 'vwap_extreme_dev', 'vwap_bias_dev',
+    'obi_strong', 'signal_threshold', 'edge_min',
+    'same_dir_price_step', 'reverse_min_move',
+    'gap_reversal_weight', 'open_range_break_pct'
+}
+
 SIGNED_FLOAT_KEYS = {
     'risk_daily_profit_floor'
 }
@@ -232,10 +271,10 @@ def get_debug_log_path(target_date=None):
 
 def get_strategy_snapshot():
     """抽取策略关键参数，便于回放日志时对照当时配置。"""
-    keys = STRATEGY_FLOAT_KEYS + STRATEGY_INT_KEYS + STRATEGY_BOOL_KEYS
     with state_lock:
-        snapshot = {k: success_rates.get(k) for k in keys}
+        snapshot = {k: success_rates.get(k) for k in GLOBAL_STRATEGY_SNAPSHOT_KEYS}
         snapshot['time_slot_templates'] = copy.deepcopy(success_rates.get('time_slot_templates', {}))
+        snapshot['stock_strategies'] = copy.deepcopy(success_rates.get('stock_strategies', {}))
         return snapshot
 
 def log_debug_event(event, payload=None, target_date=None):
@@ -266,95 +305,220 @@ def to_bool(v):
         return v.strip().lower() in ('1', 'true', 'yes', 'on')
     return bool(v)
 
-def normalize_strategy_patch(patch):
-    """把外部传入的策略参数标准化并做边界校验。"""
+def _normalize_scalar_patch(
+    patch,
+    *,
+    float_keys,
+    int_keys,
+    bool_keys,
+    signed_float_keys=SIGNED_FLOAT_KEYS,
+    unit_interval_float_keys=UNIT_INTERVAL_FLOAT_KEYS,
+    prefix=''
+):
     normalized = {}
     errors = {}
 
-    for key in STRATEGY_FLOAT_KEYS:
+    def field_name(key):
+        return f"{prefix}.{key}" if prefix else key
+
+    for key in float_keys:
         if key not in patch:
             continue
         try:
             val = float(patch[key])
         except Exception:
-            errors[key] = f'invalid float: {patch[key]}'
+            errors[field_name(key)] = f'invalid float: {patch[key]}'
             continue
-        if key not in SIGNED_FLOAT_KEYS and val < 0:
-            errors[key] = 'must be >= 0'
+        if key not in signed_float_keys and val < 0:
+            errors[field_name(key)] = 'must be >= 0'
             continue
-        if key in SIGNED_FLOAT_KEYS and abs(val) > 100:
-            errors[key] = 'must be between -100 and 100'
+        if key in signed_float_keys and abs(val) > 100:
+            errors[field_name(key)] = 'must be between -100 and 100'
             continue
-        # 这些字段都按比例处理，限制在 [0, 1] 以内
-        if key in UNIT_INTERVAL_FLOAT_KEYS and val > 1:
-            errors[key] = 'must be <= 1'
+        if key in unit_interval_float_keys and val > 1:
+            errors[field_name(key)] = 'must be <= 1'
             continue
         normalized[key] = val
 
-    for key in STRATEGY_INT_KEYS:
+    for key in int_keys:
         if key not in patch:
             continue
         try:
             val = int(patch[key])
         except Exception:
-            errors[key] = f'invalid int: {patch[key]}'
+            errors[field_name(key)] = f'invalid int: {patch[key]}'
             continue
         if val <= 0:
-            errors[key] = 'must be > 0'
+            errors[field_name(key)] = 'must be > 0'
             continue
         normalized[key] = val
 
-    for key in STRATEGY_BOOL_KEYS:
+    for key in bool_keys:
         if key not in patch:
             continue
         normalized[key] = to_bool(patch[key])
 
-    if 'time_slot_templates' in patch:
-        tpl = patch['time_slot_templates']
-        if not isinstance(tpl, dict):
-            errors['time_slot_templates'] = 'must be object'
-        else:
-            clean_tpl = {}
-            for slot, cfg in tpl.items():
-                if not isinstance(cfg, dict):
-                    errors[f'time_slot_templates.{slot}'] = 'must be object'
-                    continue
-                slot_cfg = {}
-                for k, v in cfg.items():
-                    if k in STRATEGY_FLOAT_KEYS:
-                        try:
-                            fv = float(v)
-                        except Exception:
-                            errors[f'time_slot_templates.{slot}.{k}'] = f'invalid float: {v}'
-                            continue
-                        if k not in SIGNED_FLOAT_KEYS and fv < 0:
-                            errors[f'time_slot_templates.{slot}.{k}'] = 'must be >= 0'
-                            continue
-                        if k in SIGNED_FLOAT_KEYS and abs(fv) > 100:
-                            errors[f'time_slot_templates.{slot}.{k}'] = 'must be between -100 and 100'
-                            continue
-                        if k in UNIT_INTERVAL_FLOAT_KEYS and fv > 1:
-                            errors[f'time_slot_templates.{slot}.{k}'] = 'must be <= 1'
-                            continue
-                        slot_cfg[k] = fv
-                    elif k in STRATEGY_INT_KEYS:
-                        try:
-                            iv = int(v)
-                        except Exception:
-                            errors[f'time_slot_templates.{slot}.{k}'] = f'invalid int: {v}'
-                            continue
-                        if iv <= 0:
-                            errors[f'time_slot_templates.{slot}.{k}'] = 'must be > 0'
-                            continue
-                        slot_cfg[k] = iv
-                    elif k in STRATEGY_BOOL_KEYS:
-                        slot_cfg[k] = to_bool(v)
-                    else:
-                        errors[f'time_slot_templates.{slot}.{k}'] = 'unsupported key'
-                clean_tpl[str(slot)] = slot_cfg
-            normalized['time_slot_templates'] = clean_tpl
+    return normalized, errors
+
+
+def _normalize_time_slot_templates(tpl, *, float_keys, int_keys, bool_keys, prefix='time_slot_templates'):
+    clean_tpl = {}
+    errors = {}
+    if not isinstance(tpl, dict):
+        return None, {prefix: 'must be object'}
+
+    for slot, cfg in tpl.items():
+        slot_name = str(slot)
+        if not isinstance(cfg, dict):
+            errors[f'{prefix}.{slot_name}'] = 'must be object'
+            continue
+        slot_cfg, slot_errors = _normalize_scalar_patch(
+            cfg,
+            float_keys=float_keys,
+            int_keys=int_keys,
+            bool_keys=bool_keys,
+            prefix=f'{prefix}.{slot_name}'
+        )
+        errors.update(slot_errors)
+
+        supported_keys = set(float_keys) | set(int_keys) | set(bool_keys)
+        for key in cfg.keys():
+            if key not in supported_keys:
+                errors[f'{prefix}.{slot_name}.{key}'] = 'unsupported key'
+        clean_tpl[slot_name] = slot_cfg
+
+    return clean_tpl, errors
+
+
+def _normalize_signal_profile_patch(profile_patch, prefix='signal_profile'):
+    normalized = {}
+    errors = {}
+
+    if not isinstance(profile_patch, dict):
+        return None, {prefix: 'must be object'}
+
+    for key in SIGNAL_PROFILE_FLOAT_KEYS:
+        if key not in profile_patch:
+            continue
+        try:
+            val = float(profile_patch[key])
+        except Exception:
+            errors[f'{prefix}.{key}'] = f'invalid float: {profile_patch[key]}'
+            continue
+        if val < 0:
+            errors[f'{prefix}.{key}'] = 'must be >= 0'
+            continue
+        if key in SIGNAL_PROFILE_UNIT_INTERVAL_FLOAT_KEYS and val > 1:
+            errors[f'{prefix}.{key}'] = 'must be <= 1'
+            continue
+        normalized[key] = val
+
+    for key in SIGNAL_PROFILE_INT_KEYS:
+        if key not in profile_patch:
+            continue
+        try:
+            val = int(profile_patch[key])
+        except Exception:
+            errors[f'{prefix}.{key}'] = f'invalid int: {profile_patch[key]}'
+            continue
+        if val <= 0:
+            errors[f'{prefix}.{key}'] = 'must be > 0'
+            continue
+        normalized[key] = val
+
+    for key in SIGNAL_PROFILE_STR_KEYS:
+        if key not in profile_patch:
+            continue
+        normalized[key] = str(profile_patch[key]).strip()
+
+    supported_keys = set(SIGNAL_PROFILE_FLOAT_KEYS) | set(SIGNAL_PROFILE_INT_KEYS) | set(SIGNAL_PROFILE_STR_KEYS)
+    for key in profile_patch.keys():
+        if key not in supported_keys:
+            errors[f'{prefix}.{key}'] = 'unsupported key'
 
     return normalized, errors
+
+
+def _normalize_stock_strategy_patch(patch, prefix='stock_strategies'):
+    normalized, errors = _normalize_scalar_patch(
+        patch,
+        float_keys=STOCK_STRATEGY_FLOAT_KEYS,
+        int_keys=STOCK_STRATEGY_INT_KEYS,
+        bool_keys=STOCK_STRATEGY_BOOL_KEYS,
+        prefix=prefix
+    )
+
+    if 'time_slot_templates' in patch:
+        clean_tpl, tpl_errors = _normalize_time_slot_templates(
+            patch['time_slot_templates'],
+            float_keys=STOCK_STRATEGY_FLOAT_KEYS,
+            int_keys=STOCK_STRATEGY_INT_KEYS,
+            bool_keys=STOCK_STRATEGY_BOOL_KEYS,
+            prefix=f'{prefix}.time_slot_templates'
+        )
+        errors.update(tpl_errors)
+        if clean_tpl is not None:
+            normalized['time_slot_templates'] = clean_tpl
+
+    if 'signal_profile' in patch:
+        clean_profile, profile_errors = _normalize_signal_profile_patch(
+            patch['signal_profile'],
+            prefix=f'{prefix}.signal_profile'
+        )
+        errors.update(profile_errors)
+        if clean_profile is not None:
+            normalized['signal_profile'] = clean_profile
+
+    supported_keys = set(STOCK_STRATEGY_FLOAT_KEYS) | set(STOCK_STRATEGY_INT_KEYS) | set(STOCK_STRATEGY_BOOL_KEYS) | {'time_slot_templates', 'signal_profile'}
+    for key in patch.keys():
+        if key not in supported_keys:
+            errors[f'{prefix}.{key}'] = 'unsupported key'
+
+    return normalized, errors
+
+
+def normalize_strategy_patch(patch):
+    """把外部传入的策略参数标准化并做边界校验。"""
+    normalized, errors = _normalize_scalar_patch(
+        patch,
+        float_keys=STRATEGY_FLOAT_KEYS,
+        int_keys=STRATEGY_INT_KEYS,
+        bool_keys=STRATEGY_BOOL_KEYS
+    )
+
+    if 'time_slot_templates' in patch:
+        clean_tpl, tpl_errors = _normalize_time_slot_templates(
+            patch['time_slot_templates'],
+            float_keys=STRATEGY_FLOAT_KEYS,
+            int_keys=STRATEGY_INT_KEYS,
+            bool_keys=STRATEGY_BOOL_KEYS,
+            prefix='time_slot_templates'
+        )
+        errors.update(tpl_errors)
+        if clean_tpl is not None:
+            normalized['time_slot_templates'] = clean_tpl
+
+    if 'stock_strategies' in patch:
+        stock_patch = patch['stock_strategies']
+        if not isinstance(stock_patch, dict):
+            errors['stock_strategies'] = 'must be object'
+        else:
+            clean_stock = {}
+            for raw_code, cfg in stock_patch.items():
+                code = str(raw_code or '').strip().lower()
+                if not code:
+                    errors['stock_strategies.<code>'] = 'invalid stock code'
+                    continue
+                if not isinstance(cfg, dict):
+                    errors[f'stock_strategies.{code}'] = 'must be object'
+                    continue
+                clean_cfg, cfg_errors = _normalize_stock_strategy_patch(cfg, prefix=f'stock_strategies.{code}')
+                errors.update(cfg_errors)
+                clean_stock[code] = clean_cfg
+            normalized['stock_strategies'] = clean_stock
+
+    return normalized, errors
+
 
 def apply_strategy_patch(patch):
     """
@@ -365,19 +529,37 @@ def apply_strategy_patch(patch):
     if errors:
         return False, errors, {}
 
+    changed_codes = set()
     with state_lock:
-        prev_window = int(success_rates.get('buy_pause_window', 20))
         for k, v in normalized.items():
+            if k in ('time_slot_templates', 'stock_strategies'):
+                continue
             success_rates[k] = v
-        # time slot 模板按整体覆盖，避免残留旧键
+
         if 'time_slot_templates' in normalized:
             success_rates['time_slot_templates'] = copy.deepcopy(normalized['time_slot_templates'])
-        new_window = int(success_rates.get('buy_pause_window', prev_window))
+            changed_codes.update(list(active_stocks.keys()))
 
-        # 窗口变化后重建缓存
-        if new_window != prev_window:
-            for code in list(buy_outcomes.keys()):
-                buy_outcomes[code] = load_recent_buy_outcomes(code, new_window)
+        if 'stock_strategies' in normalized:
+            stock_map = success_rates.get('stock_strategies', {})
+            if not isinstance(stock_map, dict):
+                stock_map = {}
+            for code, cfg_patch in normalized['stock_strategies'].items():
+                current_cfg = dict(stock_map.get(code, {}))
+                for key, value in cfg_patch.items():
+                    if key in ('time_slot_templates', 'signal_profile'):
+                        current_cfg[key] = copy.deepcopy(value)
+                    else:
+                        current_cfg[key] = value
+                stock_map[code] = current_cfg
+                changed_codes.add(code)
+            success_rates['stock_strategies'] = stock_map
+
+        if any(key in normalized for key in (STOCK_STRATEGY_FLOAT_KEYS + STOCK_STRATEGY_INT_KEYS + STOCK_STRATEGY_BOOL_KEYS)):
+            changed_codes.update(list(active_stocks.keys()))
+
+    for code in sorted(changed_codes):
+        sync_stock_strategy_runtime(code)
 
     return True, {}, normalized
 
@@ -765,7 +947,8 @@ success_rates = {
     'debug_log_enabled': True,
     # 收盘后自动生成日报
     'auto_daily_report_enabled': True,
-    'stocks': {}
+    'stocks': {},
+    'stock_strategies': {}
 }
 last_signal_time = {} # code -> timestamp
 stock_contexts = {} # code -> { 'trend': '', 'industry': '', 'news': [] }
@@ -886,7 +1069,7 @@ def build_pre_close_alert_snapshot(pending_list, current_state, now=None):
             hit_win = current_price <= win_price if win_price > 0 else False
             hit_stop = current_price >= stop_price if stop_price > 0 else False
 
-        gross_return, net_return, predicted = classify_trade_result(sig_type, entry_price, current_price)
+        gross_return, net_return, predicted = classify_trade_result(sig_type, entry_price, current_price, code=code)
         should_flatten = (stage in ('warn', 'force')) and (not hit_win) and (not hit_stop)
         alert_items.append({
             'signal_id': sig.get('id'),
@@ -1689,12 +1872,87 @@ def parse_signal_score(desc):
         return 0.0
     return int(m.group(1)) / 100.0
 
-def get_stock_signal_profile(code):
+def build_default_signal_profile(code):
     profile = dict(DEFAULT_SIGNAL_PROFILE)
-    custom = STOCK_SIGNAL_PROFILES.get(str(code or '').lower(), {})
+    custom = STOCK_SIGNAL_PROFILES.get(str(code or '').strip().lower(), {})
     if isinstance(custom, dict):
-        profile.update(custom)
+        profile.update(copy.deepcopy(custom))
     return profile
+
+
+def build_default_time_slot_templates(code):
+    c = str(code or '').strip().lower()
+    if c and c in TIME_SLOT_TEMPLATES_BY_CODE:
+        tpl = TIME_SLOT_TEMPLATES_BY_CODE.get(c, {})
+        if isinstance(tpl, dict):
+            return copy.deepcopy(tpl)
+    with state_lock:
+        tpl = success_rates.get('time_slot_templates', {})
+    if isinstance(tpl, dict) and tpl:
+        return copy.deepcopy(tpl)
+    return copy.deepcopy(DEFAULT_TIME_SLOT_TEMPLATES)
+
+
+def get_stock_strategy_config(code):
+    c = str(code or '').strip().lower()
+    if not c:
+        return {}
+    with state_lock:
+        stock_map = success_rates.get('stock_strategies', {})
+        if not isinstance(stock_map, dict):
+            return {}
+        cfg = stock_map.get(c, {})
+    return copy.deepcopy(cfg) if isinstance(cfg, dict) else {}
+
+
+def ensure_stock_strategy(code):
+    c = str(code or '').strip().lower()
+    if not c:
+        return {}
+
+    current = get_stock_strategy_config(c)
+    if current:
+        return current
+
+    default_cfg = {
+        'time_slot_templates': build_default_time_slot_templates(c),
+        'signal_profile': build_default_signal_profile(c)
+    }
+    with state_lock:
+        stock_map = success_rates.setdefault('stock_strategies', {})
+        existing = stock_map.get(c)
+        if not isinstance(existing, dict) or not existing:
+            stock_map[c] = copy.deepcopy(default_cfg)
+            existing = stock_map[c]
+    return copy.deepcopy(existing)
+
+
+def sync_stock_strategy_runtime(code):
+    c = str(code or '').strip().lower()
+    if not c:
+        return
+
+    profile = get_stock_signal_profile(c)
+    strategy = get_effective_strategy(code=c)
+    window = max(1, int(strategy.get('buy_pause_window', 20)))
+    loaded = load_recent_buy_outcomes(c, window)
+
+    with state_lock:
+        analyzer = analyzers.get(c)
+        if analyzer is not None:
+            analyzer.profile = dict(profile)
+        if c in active_stocks or c in buy_outcomes:
+            buy_outcomes[c] = loaded
+
+
+def get_stock_signal_profile(code):
+    profile = build_default_signal_profile(code)
+    stock_cfg = get_stock_strategy_config(code)
+    custom = stock_cfg.get('signal_profile', {}) if isinstance(stock_cfg, dict) else {}
+    if isinstance(custom, dict):
+        profile.update(copy.deepcopy(custom))
+    return profile
+
 
 def parse_minute_of_day(time_str):
     try:
@@ -1734,12 +1992,16 @@ def get_time_slot_label(time_str=None):
 
 def get_time_slot_templates_for_code(code=None):
     c = str(code or '').strip().lower()
+    stock_cfg = get_stock_strategy_config(c)
+    tpl = stock_cfg.get('time_slot_templates', {}) if isinstance(stock_cfg, dict) else {}
+    if isinstance(tpl, dict) and tpl:
+        return copy.deepcopy(tpl)
     if c and c in TIME_SLOT_TEMPLATES_BY_CODE:
         tpl = TIME_SLOT_TEMPLATES_BY_CODE.get(c, {})
-        return tpl if isinstance(tpl, dict) else {}
+        return copy.deepcopy(tpl) if isinstance(tpl, dict) else {}
     with state_lock:
         tpl = success_rates.get('time_slot_templates', {})
-    return tpl if isinstance(tpl, dict) else {}
+    return copy.deepcopy(tpl) if isinstance(tpl, dict) else {}
 
 def derive_baseline_strategy_from_templates(templates):
     """从时段模板推导该股票的基础阈值（用于覆盖全局默认）。"""
@@ -1767,16 +2029,21 @@ def get_effective_strategy(time_str=None, code=None):
     """
     读取当前生效策略：
     - 先拿全局参数
+    - 再叠加个股专属参数
     - 若开启 time_slot_enabled，则叠加对应时段模板
     """
     slot = get_time_slot_label(time_str)
     templates = get_time_slot_templates_for_code(code)
     baseline = derive_baseline_strategy_from_templates(templates)
+    stock_cfg = get_stock_strategy_config(code)
 
     with state_lock:
-        effective = {k: success_rates.get(k) for k in (STRATEGY_FLOAT_KEYS + STRATEGY_INT_KEYS + STRATEGY_BOOL_KEYS)}
+        effective = {k: success_rates.get(k) for k in GLOBAL_STRATEGY_SNAPSHOT_KEYS}
 
-    # 个股基线覆盖全局默认（比如 win/loss/buy/sell 阈值）。
+    for key in STOCK_STRATEGY_FLOAT_KEYS + STOCK_STRATEGY_INT_KEYS + STOCK_STRATEGY_BOOL_KEYS:
+        if key in stock_cfg:
+            effective[key] = stock_cfg[key]
+
     for k, v in baseline.items():
         effective[k] = v
 
@@ -1975,11 +2242,12 @@ def get_buy_pause_state(code):
     返回 (is_paused, samples, win_rate)。
     BUY 质量过差时先暂停该票 BUY，SELL 不受影响。
     """
+    strategy = get_effective_strategy(code=code)
+    auto_pause = bool(strategy.get('buy_auto_pause', True))
+    window = max(1, int(strategy.get('buy_pause_window', 20)))
+    min_samples = max(1, int(strategy.get('buy_pause_min_samples', 10)))
+    min_wr = float(strategy.get('buy_pause_min_wr', 0.35))
     with state_lock:
-        auto_pause = bool(success_rates.get('buy_auto_pause', True))
-        window = max(1, int(success_rates.get('buy_pause_window', 20)))
-        min_samples = max(1, int(success_rates.get('buy_pause_min_samples', 10)))
-        min_wr = float(success_rates.get('buy_pause_min_wr', 0.35))
         dq = buy_outcomes.get(code)
 
     if not auto_pause:
@@ -1998,16 +2266,19 @@ def get_buy_pause_state(code):
     wr = sum(dq) / samples if samples > 0 else 0.0
     return wr < min_wr, samples, wr
 
+
 def record_buy_outcome(code, is_success):
+    strategy = get_effective_strategy(code=code)
+    window = max(1, int(strategy.get('buy_pause_window', 20)))
     with state_lock:
-        window = max(1, int(success_rates.get('buy_pause_window', 20)))
         dq = buy_outcomes.get(code)
         if dq is None or dq.maxlen != window:
             dq = load_recent_buy_outcomes(code, window)
             buy_outcomes[code] = dq
         dq.append(1 if is_success else 0)
 
-def classify_trade_result(sig_type, entry_price, current_price):
+
+def classify_trade_result(sig_type, entry_price, current_price, code=None):
     """
     统一收益判定（按净收益）：
     - gross_return: 毛收益率（小数，如 0.01 = +1%）
@@ -2019,8 +2290,12 @@ def classify_trade_result(sig_type, entry_price, current_price):
     if entry <= 0:
         return 0.0, 0.0, 'fail'
 
-    with state_lock:
-        cost_buffer = float(success_rates.get('trade_cost_buffer', 0.0012))
+    if code:
+        strategy = get_effective_strategy(code=code)
+        cost_buffer = float(strategy.get('trade_cost_buffer', 0.0012))
+    else:
+        with state_lock:
+            cost_buffer = float(success_rates.get('trade_cost_buffer', 0.0012))
     if str(sig_type) == 'BUY':
         gross_return = (cur - entry) / entry
     else:
@@ -2091,13 +2366,13 @@ def get_recent_regime_quality(code, sig_type, slot, lookback_days=10):
 def evaluate_regime_gate(code, sig, effective):
     """返回 (accepted, reasons, meta)，用于“只做策略内 T”过滤。"""
     with state_lock:
-        enabled = bool(success_rates.get('regime_filter_enabled', True))
-        target_wr = float(success_rates.get('regime_target_wr', 0.75))
-        lookback_days = int(success_rates.get('regime_lookback_days', 10))
-        min_samples = int(success_rates.get('regime_min_samples', 20))
-        slot_min_samples = int(success_rates.get('regime_slot_min_samples', 5))
-        require_trend = bool(success_rates.get('regime_require_trend_alignment', True))
-        block_open_close = bool(success_rates.get('regime_block_open_close', True))
+        enabled = bool(effective.get('regime_filter_enabled', True))
+        target_wr = float(effective.get('regime_target_wr', 0.75))
+        lookback_days = int(effective.get('regime_lookback_days', 10))
+        min_samples = int(effective.get('regime_min_samples', 20))
+        slot_min_samples = int(effective.get('regime_slot_min_samples', 5))
+        require_trend = bool(effective.get('regime_require_trend_alignment', True))
+        block_open_close = bool(effective.get('regime_block_open_close', True))
         trend_text = str(stock_contexts.get(code, {}).get('trend', ''))
         alerts = list(health_state.get('alerts', []))
 
@@ -2277,7 +2552,7 @@ def resolve_pending_after_market_close(force_today=False):
             if data_list:
                 cp = data_list[-1].get('price', cp)
 
-            gross_return, net_return, final = classify_trade_result(sig.get('type'), sig.get('price', 0.0), cp)
+            gross_return, net_return, final = classify_trade_result(sig.get('type'), sig.get('price', 0.0), cp, code=code)
             sig['status'] = final
             sig['resolved_price'] = cp
             sig['gross_profit_pct'] = gross_return * 100
@@ -2917,6 +3192,8 @@ def apply_add_stock(query, persist=True):
     if not resolved_code:
         return False, f"❌ 未找到匹配的A股: {query}"
 
+    ensure_stock_strategy(resolved_code)
+
     with state_lock:
         if resolved_code in active_stocks:
             return False, "⚠️ 该股票已在监控中"
@@ -2996,10 +3273,8 @@ def apply_add_stock(query, persist=True):
             analyzers[resolved_code] = analyzer
             # 保留恢复出来的真实冷却时间，不再重置为 0
             last_signal_time[resolved_code] = analyzer.last_signal_time
-            buy_outcomes[resolved_code] = load_recent_buy_outcomes(
-                resolved_code,
-                max(1, int(success_rates.get('buy_pause_window', 20)))
-            )
+
+        sync_stock_strategy_runtime(resolved_code)
 
         log_debug_event(
             'stock_added',
@@ -3022,7 +3297,10 @@ def apply_add_stock(query, persist=True):
 def apply_remove_stock(code, persist=True):
     c = str(code or '').strip().lower()
     if not c:
-        return
+        return False, 'missing code'
+    if c == FOCUS_STOCK_CODE:
+        return False, f"⚠️ {FOCUS_STOCK_NAME} 为固定首票，不能移除"
+
     removed_name = None
     purged_runtime = 0
     with state_lock:
@@ -3060,32 +3338,36 @@ def apply_remove_stock(code, persist=True):
                     stock_stats[sc] = {'success': 0, 'fail': 0}
                 stock_stats[sc][st] += 1
             success_rates['stocks'] = stock_stats
-    if removed_name:
-        if persist:
-            remove_watchlist_entry(c)
-        purged_db = db_delete_signals_by_code(c)
-        log_debug_event(
-            'stock_removed',
-            {
-                'code': c,
-                'name': removed_name,
-                'purged_runtime_signals': purged_runtime,
-                'purged_db_signals': purged_db
-            }
-        )
+
+    if not removed_name:
+        return False, '⚠️ 该股票不在监控中'
+
+    if persist:
+        remove_watchlist_entry(c)
+    purged_db = db_delete_signals_by_code(c)
+    log_debug_event(
+        'stock_removed',
+        {
+            'code': c,
+            'name': removed_name,
+            'purged_runtime_signals': purged_runtime,
+            'purged_db_signals': purged_db
+        }
+    )
+    return True, removed_name
+
+def get_restore_watchlist_codes():
+    seed_default_watchlist_if_empty()
+    watch_codes = [str(code or '').strip().lower() for code in list_enabled_watchlist_codes() if str(code or '').strip()]
+    focus = FOCUS_STOCK_CODE
+    if focus not in watch_codes:
+        upsert_watchlist_entry(focus, FOCUS_STOCK_NAME)
+        watch_codes.insert(0, focus)
+    ordered_codes = [focus] + [code for code in watch_codes if code != focus]
+    return ordered_codes[:MAX_STOCKS]
 
 def restore_watchlist_on_startup():
-    seed_default_watchlist_if_empty()
-    watch_codes = list_enabled_watchlist_codes()
-    if SINGLE_STOCK_MODE:
-        # 单票模式仅恢复焦点票，避免旧watchlist把多票重新拉起。
-        focus = FOCUS_STOCK_CODE
-        if focus not in watch_codes:
-            upsert_watchlist_entry(focus, FOCUS_STOCK_NAME)
-            watch_codes = [focus]
-        else:
-            watch_codes = [focus]
-    for code in watch_codes:
+    for code in get_restore_watchlist_codes():
         ok, msg = apply_add_stock(code, persist=False)
         if ok:
             with state_lock:
@@ -3346,7 +3628,7 @@ def fetch_worker():
                                 sig['stop_price'] = max(sig['stop_price'], sig['price'] * 1.001)
 
                             if cp >= sig['price'] * (1 + win_threshold):
-                                gross_return, net_return, final = classify_trade_result(sig.get('type'), sig.get('price', 0.0), cp)
+                                gross_return, net_return, final = classify_trade_result(sig.get('type'), sig.get('price', 0.0), cp, code=code)
                                 sig['status'] = final
                                 sig['resolved_price'] = cp
                                 sig['gross_profit_pct'] = gross_return * 100
@@ -3379,7 +3661,7 @@ def fetch_worker():
                                     'strategy': get_strategy_snapshot()
                                 })
                             elif cp <= sig['stop_price']:
-                                gross_return, net_return, final = classify_trade_result(sig.get('type'), sig.get('price', 0.0), cp)
+                                gross_return, net_return, final = classify_trade_result(sig.get('type'), sig.get('price', 0.0), cp, code=code)
                                 sig['status'] = final
                                 sig['resolved_price'] = cp
                                 sig['gross_profit_pct'] = gross_return * 100
@@ -3424,7 +3706,7 @@ def fetch_worker():
                                 sig['stop_price'] = min(sig['stop_price'], sig['price'] * 0.999)
 
                             if cp <= sig['price'] * (1 - win_threshold):
-                                gross_return, net_return, final = classify_trade_result(sig.get('type'), sig.get('price', 0.0), cp)
+                                gross_return, net_return, final = classify_trade_result(sig.get('type'), sig.get('price', 0.0), cp, code=code)
                                 sig['status'] = final
                                 sig['resolved_price'] = cp
                                 sig['gross_profit_pct'] = gross_return * 100
@@ -3455,7 +3737,7 @@ def fetch_worker():
                                     'strategy': get_strategy_snapshot()
                                 })
                             elif cp >= sig['stop_price']:
-                                gross_return, net_return, final = classify_trade_result(sig.get('type'), sig.get('price', 0.0), cp)
+                                gross_return, net_return, final = classify_trade_result(sig.get('type'), sig.get('price', 0.0), cp, code=code)
                                 sig['status'] = final
                                 sig['resolved_price'] = cp
                                 sig['gross_profit_pct'] = gross_return * 100
@@ -3642,7 +3924,10 @@ def build_data_payload(since_ts=None, force_full=False):
         'global': global_snapshot,
         'pre_close': pre_close_snapshot,
         'paper': paper_snapshot,
-        'is_trading': is_trading_time()
+        'is_trading': is_trading_time(),
+        'focus_stock_code': FOCUS_STOCK_CODE,
+        'focus_stock_name': FOCUS_STOCK_NAME,
+        'max_stocks': MAX_STOCKS
     }
 
 @app.route('/')
@@ -4543,10 +4828,7 @@ if __name__ == '__main__':
     if sock is None:
         print("⚠️ WebSocket 未启用 (未安装 flask-sock)，前端将回退为轮询模式")
     
-    if SINGLE_STOCK_MODE:
-        print(f"🚀 启动{FOCUS_STOCK_NAME}单票做T专用版 Web 端 (focus={FOCUS_STOCK_CODE})...")
-    else:
-        print("🚀 启动量化策略多只自选版 Web 端...")
+    print(f"🚀 启动多票盯盘 Web 端 (focus={FOCUS_STOCK_NAME}/{FOCUS_STOCK_CODE}, max={MAX_STOCKS})...")
     t = threading.Thread(target=fetch_worker, daemon=True)
     t.start()
     port = int(os.getenv('PORT', 8080))

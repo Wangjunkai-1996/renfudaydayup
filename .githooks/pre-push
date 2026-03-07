@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+DEPLOY_SCRIPT="${DEPLOY_SCRIPT:-${REPO_ROOT}/scripts/deploy_server.sh}"
+DEPLOY_BRANCH="${DEPLOY_BRANCH:-master}"
+DEPLOY_REMOTE="${DEPLOY_REMOTE:-origin}"
+HOOK_LOG="${HOOK_LOG:-/tmp/renfu-pre-push.log}"
+HOOK_STATE_DIR="${HOOK_STATE_DIR:-/tmp/renfu-pre-push.state.d}"
+LATEST_TARGET_FILE="${LATEST_TARGET_FILE:-${HOOK_STATE_DIR}/latest_target}"
+DEPLOY_DEBOUNCE_SEC="${DEPLOY_DEBOUNCE_SEC:-8}"
+
+remote_name="${1:-}"
+target_ref="refs/heads/${DEPLOY_BRANCH}"
+expected_sha=""
+
+ensure_state_dir() {
+  mkdir -p "${HOOK_STATE_DIR}"
+}
+
+write_latest_target() {
+  local sha="$1"
+  local tmp_file
+  tmp_file="$(mktemp "${HOOK_STATE_DIR}/latest_target.XXXXXX")"
+  {
+    echo "sha=${sha}"
+    echo "remote=${DEPLOY_REMOTE}"
+    echo "branch=${DEPLOY_BRANCH}"
+    echo "updated_at=$(date '+%F %T')"
+  } > "${tmp_file}"
+  mv "${tmp_file}" "${LATEST_TARGET_FILE}"
+}
+
+read_latest_sha() {
+  if [[ ! -f "${LATEST_TARGET_FILE}" ]]; then
+    return 1
+  fi
+  sed -n 's/^sha=//p' "${LATEST_TARGET_FILE}" | head -n 1
+}
+
+is_latest_target() {
+  local sha="$1"
+  local current_sha
+  current_sha="$(read_latest_sha || true)"
+  [[ -n "${current_sha}" && "${current_sha}" == "${sha}" ]]
+}
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  if [[ "${remote_name}" == "${DEPLOY_REMOTE}" && "${remote_ref}" == "${target_ref}" ]]; then
+    expected_sha="${local_sha}"
+    break
+  fi
+done
+
+if [[ -z "${expected_sha}" ]]; then
+  exit 0
+fi
+
+ensure_state_dir
+write_latest_target "${expected_sha}"
+
+if [[ ! -x "${DEPLOY_SCRIPT}" ]]; then
+  {
+    echo "[$(date '+%F %T')] skip: deploy script not executable: ${DEPLOY_SCRIPT}"
+  } >> "${HOOK_LOG}"
+  exit 0
+fi
+
+echo "[renfu] deploy scheduled in background -> ${HOOK_LOG}" >&2
+
+(
+  set -euo pipefail
+
+  log() {
+    echo "[$(date '+%F %T')] $*" >> "${HOOK_LOG}"
+  }
+
+  latest_sha() {
+    read_latest_sha || true
+  }
+
+  log "detected push to ${DEPLOY_REMOTE}/${DEPLOY_BRANCH}, latest target ${expected_sha}"
+
+  synced=0
+  for _ in $(seq 1 45); do
+    if ! is_latest_target "${expected_sha}"; then
+      log "skip deploy wait: superseded by newer target $(latest_sha)"
+      exit 0
+    fi
+
+    remote_line="$(git ls-remote "${DEPLOY_REMOTE}" "${target_ref}" || true)"
+    remote_sha="${remote_line%%[[:space:]]*}"
+    if [[ "${remote_sha}" == "${expected_sha}" ]]; then
+      synced=1
+      break
+    fi
+    sleep 1
+  done
+
+  if [[ "${synced}" -ne 1 ]]; then
+    log "skip deploy: remote ${target_ref} did not reach ${expected_sha}"
+    exit 0
+  fi
+
+  if [[ "${DEPLOY_DEBOUNCE_SEC}" =~ ^[0-9]+$ ]] && (( DEPLOY_DEBOUNCE_SEC > 0 )); then
+    sleep "${DEPLOY_DEBOUNCE_SEC}"
+  fi
+
+  if ! is_latest_target "${expected_sha}"; then
+    log "skip deploy: superseded by newer target $(latest_sha)"
+    exit 0
+  fi
+
+  log "running deploy script ${DEPLOY_SCRIPT} for ${expected_sha}"
+
+  if DEPLOY_COMMIT_SHA="${expected_sha}" DEPLOY_TARGET_FILE="${LATEST_TARGET_FILE}" "${DEPLOY_SCRIPT}" >> "${HOOK_LOG}" 2>&1; then
+    log "deploy finished for ${expected_sha}"
+  else
+    log "deploy failed for ${expected_sha}"
+  fi
+) >/dev/null 2>&1 &
+
+exit 0

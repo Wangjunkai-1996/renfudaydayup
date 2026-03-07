@@ -200,8 +200,9 @@ def register_management_routes(
 
     @bp.route('/api/stocks/<code>', methods=['DELETE'])
     def api_remove_stock_route(code):
-        apply_remove_stock(code.lower())
-        return jsonify({'success': True})
+        success, msg = apply_remove_stock(code.lower())
+        status = 200 if success else 400
+        return jsonify({'success': success, 'msg': msg}), status
 
     @bp.route('/api/history')
     def api_history_route():

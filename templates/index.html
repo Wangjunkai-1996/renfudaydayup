@@ -333,7 +333,10 @@
             global: { indices: [], update_time: '' },
             pre_close: {},
             paper: null,
-            is_trading: false
+            is_trading: false,
+            focus_stock_code: '',
+            focus_stock_name: '',
+            max_stocks: 3
         };
 
         function bootstrapApiToken() {
@@ -406,7 +409,10 @@
                     global: payload.global || { indices: [], update_time: '' },
                     pre_close: payload.pre_close || {},
                     paper: payload.paper || null,
-                    is_trading: !!payload.is_trading
+                    is_trading: !!payload.is_trading,
+                    focus_stock_code: payload.focus_stock_code || '',
+                    focus_stock_name: payload.focus_stock_name || '',
+                    max_stocks: Number(payload.max_stocks || 3)
                 };
                 Object.keys(incomingMarket).forEach(code => {
                     const series = Array.isArray(incomingMarket[code]) ? incomingMarket[code] : [];
@@ -452,6 +458,9 @@
                 viewState.pre_close = payload.pre_close || {};
                 viewState.paper = payload.paper || null;
                 viewState.is_trading = !!payload.is_trading;
+                viewState.focus_stock_code = payload.focus_stock_code || viewState.focus_stock_code || '';
+                viewState.focus_stock_name = payload.focus_stock_name || viewState.focus_stock_name || '';
+                viewState.max_stocks = Number(payload.max_stocks || viewState.max_stocks || 3);
             }
 
             return viewState;
@@ -661,6 +670,8 @@
                 if (data.success) {
                     forceFullDataRefresh();
                     fetchData();
+                } else {
+                    alert(data.msg || '移除失败');
                 }
             } catch (e) { console.error(e); }
         }
@@ -670,6 +681,10 @@
             const card = document.createElement('div');
             const safeName = escapeHtml(name);
             const safeCode = escapeHtml(code);
+            const isPinnedFocus = viewState.focus_stock_code === code;
+            const actionHtml = isPinnedFocus
+                ? `<span class="text-[11px] px-3 py-1.5 rounded-lg border border-indigo-500/30 bg-indigo-500/10 text-indigo-300">固定首票</span>`
+                : `<button onclick="removeStock('${code}')" class="text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 text-sm transition px-3 py-1.5 rounded-lg">移除</button>`;
             card.id = 'chart-card-' + code;
             card.className = "bg-slate-800/80 p-4 rounded-xl border border-slate-700 flex flex-col shadow-lg h-[360px]";
             card.innerHTML = `
@@ -677,10 +692,11 @@
                     <div class="flex items-end gap-3 flex-wrap">
                         <h2 class="text-xl font-bold text-slate-100">${safeName}</h2>
                         <span class="text-sm font-normal text-slate-400 uppercase">${safeCode}</span>
+                        ${isPinnedFocus ? '<span class="text-[11px] px-2 py-0.5 rounded border border-indigo-500/30 bg-indigo-500/10 text-indigo-300">首票</span>' : ''}
                         <span id="price-badge-${code}" class="ml-2 px-2.5 py-1 rounded text-sm font-mono font-medium bg-slate-900 border border-slate-600 text-blue-400">----</span>
                         <div id="stats-badge-${code}" class="ml-auto flex items-center gap-2 text-xs"></div>
                     </div>
-                    <button onclick="removeStock('${code}')" class="text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 text-sm transition px-3 py-1.5 rounded-lg">移除</button>
+                    ${actionHtml}
                 </div>
                 
                 <div class="mb-2 flex flex-col gap-1 relative">
@@ -772,7 +788,7 @@
 
             // Responsive Layout Adaptation
             if (activeCodes.length === 0) {
-                chartsWrapper.innerHTML = '<div class="flex flex-col items-center justify-center p-20 text-slate-500 border-2 border-dashed border-slate-700/50 rounded-xl bg-slate-800/30"><svg class="w-16 h-16 mb-4 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"></path></svg><span class="text-lg font-medium">暂无监控中的股票</span><span class="text-sm mt-2 opacity-75">请在上方搜索栏输入股票代码并添加 (如: sz300402)</span></div>';
+                chartsWrapper.innerHTML = '<div class="flex flex-col items-center justify-center p-20 text-slate-500 border-2 border-dashed border-slate-700/50 rounded-xl bg-slate-800/30"><svg class="w-16 h-16 mb-4 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6"></path></svg><span class="text-lg font-medium">暂无监控中的股票</span><span class="text-sm mt-2 opacity-75">系统会固定首票江苏神通 (sz002438)，其余最多再添加 2 只</span></div>';
                 chartsWrapper.className = "grid grid-cols-1 flex-grow transition-all duration-300 min-h-[400px]";
             } else {
                 chartsWrapper.className = "flex flex-col gap-4 flex-grow transition-all duration-300";

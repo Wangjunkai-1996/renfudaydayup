@@ -23,6 +23,9 @@ def load_app(tmp_path, monkeypatch):
         else:
             monkeypatch.delenv('API_AUTH_TOKEN', raising=False)
 
+        for name in ('SERVERCHAN_SENDKEY', 'SENDKEY', 'SERVERCHAN_ENABLED', 'SERVERCHAN_NOTIFY_OPEN', 'SERVERCHAN_NOTIFY_RISK', 'SERVERCHAN_TITLE_PREFIX'):
+            monkeypatch.delenv(name, raising=False)
+
         if 'app' in sys.modules:
             del sys.modules['app']
         importlib.invalidate_caches()

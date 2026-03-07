@@ -38,6 +38,7 @@ You can deploy manually at any time:
 - Checks `http://127.0.0.1:8080/api/health`
 - Writes the latest local deploy result to `/tmp/renfu-last-deploy.status`
 - Sends a local failure notification by default when deployment fails
+- Can also push deploy success/failure to Server酱 when a SendKey is configured locally
 
 ## Useful Environment Variables
 
@@ -60,4 +61,10 @@ You can deploy manually at any time:
 - `DEPLOY_NOTIFY`: set to `0` to disable local notifications
 - `DEPLOY_NOTIFY_SUCCESS`: set to `1` to also notify on success
 - `DEPLOY_NOTIFY_TITLE`: notification title, default `Renfu Deploy`
+- `SERVERCHAN_SENDKEY`: shared SendKey for deploy notifications if `DEPLOY_SERVERCHAN_SENDKEY` is not set
+- `DEPLOY_SERVERCHAN_ENABLED`: set to `0` to disable Server酱 deploy notifications
+- `DEPLOY_SERVERCHAN_SUCCESS`: set to `1` to notify deploy success as well as failures
+- `DEPLOY_SERVERCHAN_SENDKEY`: explicit SendKey used by `scripts/deploy_server.sh`
+- `DEPLOY_SERVERCHAN_API_BASE`: Server酱 API base, default `https://sctapi.ftqq.com`
+- `DEPLOY_SERVERCHAN_TITLE`: title prefix for Server酱 deploy messages
 - `LAST_DEPLOY_STATUS_FILE`: latest local deploy status file, default `/tmp/renfu-last-deploy.status`

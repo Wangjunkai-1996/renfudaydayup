@@ -33,6 +33,7 @@ from renfu.api_auth import verify_request_token
 from renfu.date_utils import normalize_date_str
 from renfu.debug_summary import summarize_debug_entries
 from renfu.market_provider import MarketQuoteManager
+from renfu.notifications import NotificationHub
 from renfu.periodic_report_service import build_periodic_report as build_periodic_report_data
 from renfu.report_compare import compare_reports
 from renfu.request_args import parse_since_ts_arg
@@ -50,6 +51,7 @@ from renfu.watchlist_store import (
 
 app = Flask(__name__)
 sock = Sock(app) if Sock is not None else None
+notification_hub = NotificationHub.from_env()
 
 def _env_bool(name, default='0'):
     return str(os.getenv(name, default)).strip().lower() in ('1', 'true', 'yes', 'on')
@@ -2097,6 +2099,12 @@ def maybe_trigger_risk_pause(reason, context=None):
             'strategy': strategy
         }
     )
+    notification_hub.send_risk_pause(
+        reason=reason,
+        pause_minutes=pause_minutes,
+        paused_until_ts=paused_until,
+        context=context
+    )
 
 def update_risk_state_on_resolution(sig, final_status):
     now = datetime.datetime.now()
@@ -3592,6 +3600,7 @@ def fetch_worker():
                             paper_result = maybe_execute_paper_trade(new_sig, current_prices.get(code, new_sig.get('price', 0.0)))
                             with state_lock:
                                 new_sig['paper'] = paper_result
+                            notification_hub.send_signal(new_sig)
                 
                 # === 移动止损系统 (Trailing Stop) ===
                 db_updates = []
@@ -4734,6 +4743,10 @@ register_runtime_routes(
     build_periodic_report=build_periodic_report
 )
 
+def send_test_notification(title='', body=''):
+    return notification_hub.send_test(title=title, body=body)
+
+
 register_management_routes(
     app,
     state_lock=state_lock,
@@ -4753,7 +4766,8 @@ register_management_routes(
     save_param_version=save_param_version,
     get_param_version=get_param_version,
     apply_remove_stock=apply_remove_stock,
-    get_db=get_db
+    get_db=get_db,
+    send_test_notification=send_test_notification
 )
 
 register_report_routes(
@@ -4827,7 +4841,11 @@ if __name__ == '__main__':
         print("⚠️ API 写接口鉴权: 未启用 (可设置环境变量 API_AUTH_TOKEN)")
     if sock is None:
         print("⚠️ WebSocket 未启用 (未安装 flask-sock)，前端将回退为轮询模式")
-    
+    if notification_hub.is_configured():
+        print("📣 微信通知: 已启用 (Server酱)")
+    else:
+        print("⚠️ 微信通知: 未配置 (可设置环境变量 SERVERCHAN_SENDKEY)")
+
     print(f"🚀 启动多票盯盘 Web 端 (focus={FOCUS_STOCK_NAME}/{FOCUS_STOCK_CODE}, max={MAX_STOCKS})...")
     t = threading.Thread(target=fetch_worker, daemon=True)
     t.start()

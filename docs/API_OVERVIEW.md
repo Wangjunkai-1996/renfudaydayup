@@ -12,6 +12,7 @@ This project now groups Flask routes by responsibility to keep `app.py` smaller 
   - `/api/paper/*`
   - `/api/stocks` (add/remove)
   - `/api/config*` (update/read/snapshot/rollback)
+  - `/api/notify/test`
   - `/api/history`
 - `renfu/routes_reports.py`
   - `/api/debug/*`
@@ -37,6 +38,7 @@ Validation behavior:
 - Write APIs under `/api/` still use token guard from `app.py` middleware.
 - Existing payload fields for `/api/history` are kept (`signals`, `daily_stats`, `date_stats`) and now include `success` and `query` metadata.
 - `/api/config` now supports `stock_strategies` nested patches, so each stock can carry its own `time_slot_templates` and `signal_profile` plus per-stock threshold overrides.
+- `/api/notify/test` can be used to verify Server酱 delivery after `SERVERCHAN_SENDKEY` is configured.
 - Shared helper modules:
   - `renfu/request_args.py` for query parsing (`int` clamp and `since_ts` parse).
   - `renfu/history_service.py` for history SQL assembly and payload shape.

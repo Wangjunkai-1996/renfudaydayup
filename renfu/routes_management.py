@@ -28,7 +28,8 @@ def register_management_routes(
     save_param_version,
     get_param_version,
     apply_remove_stock,
-    get_db
+    get_db,
+    send_test_notification
 ):
     bp = Blueprint('management_routes', __name__)
 
@@ -201,6 +202,15 @@ def register_management_routes(
     @bp.route('/api/stocks/<code>', methods=['DELETE'])
     def api_remove_stock_route(code):
         success, msg = apply_remove_stock(code.lower())
+        status = 200 if success else 400
+        return jsonify({'success': success, 'msg': msg}), status
+
+    @bp.route('/api/notify/test', methods=['POST'])
+    def api_notify_test_route():
+        data = request.get_json(silent=True) or {}
+        title = str(data.get('title') or '测试通知').strip()
+        body = str(data.get('body') or '').strip()
+        success, msg = send_test_notification(title=title, body=body)
         status = 200 if success else 400
         return jsonify({'success': success, 'msg': msg}), status
 

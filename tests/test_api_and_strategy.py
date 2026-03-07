@@ -347,3 +347,22 @@ def test_history_endpoint_supports_code_and_status_filters(load_app):
     invalid_date_payload = invalid_date_resp.get_json()
     assert invalid_date_payload.get('success') is False
     assert 'invalid date' in (invalid_date_payload.get('msg') or '')
+
+
+def test_notify_test_endpoint_dispatches_via_hub(load_app):
+    app_module = load_app()
+    calls = []
+
+    def fake_send_test(title='', body=''):
+        calls.append({'title': title, 'body': body})
+        return True, 'queued'
+
+    app_module.notification_hub.send_test = fake_send_test
+    client = app_module.app.test_client()
+
+    resp = client.post('/api/notify/test', json={'title': '连通性测试', 'body': 'ok'})
+
+    assert resp.status_code == 200
+    payload = resp.get_json()
+    assert payload['success'] is True
+    assert calls == [{'title': '连通性测试', 'body': 'ok'}]

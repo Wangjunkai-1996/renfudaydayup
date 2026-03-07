@@ -2,6 +2,14 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEPLOY_LOCAL_ENV_FILE="${DEPLOY_LOCAL_ENV_FILE:-${HOME}/.renfu.deploy.env}"
+
+if [[ -f "${DEPLOY_LOCAL_ENV_FILE}" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "${DEPLOY_LOCAL_ENV_FILE}"
+  set +a
+fi
 
 SERVER_HOST="${SERVER_HOST:-renfu-prod}"
 SERVER_USER="${SERVER_USER:-root}"
@@ -15,6 +23,11 @@ DEPLOY_TARGET_FILE="${DEPLOY_TARGET_FILE:-}"
 DEPLOY_NOTIFY="${DEPLOY_NOTIFY:-1}"
 DEPLOY_NOTIFY_SUCCESS="${DEPLOY_NOTIFY_SUCCESS:-0}"
 DEPLOY_NOTIFY_TITLE="${DEPLOY_NOTIFY_TITLE:-Renfu Deploy}"
+DEPLOY_SERVERCHAN_ENABLED="${DEPLOY_SERVERCHAN_ENABLED:-1}"
+DEPLOY_SERVERCHAN_SUCCESS="${DEPLOY_SERVERCHAN_SUCCESS:-0}"
+DEPLOY_SERVERCHAN_SENDKEY="${DEPLOY_SERVERCHAN_SENDKEY:-${SERVERCHAN_SENDKEY:-}}"
+DEPLOY_SERVERCHAN_API_BASE="${DEPLOY_SERVERCHAN_API_BASE:-https://sctapi.ftqq.com}"
+DEPLOY_SERVERCHAN_TITLE="${DEPLOY_SERVERCHAN_TITLE:-Renfu Deploy}"
 LAST_DEPLOY_STATUS_FILE="${LAST_DEPLOY_STATUS_FILE:-/tmp/renfu-last-deploy.status}"
 
 SUPERSEDED_BY=""
@@ -47,6 +60,37 @@ OSA
   if command -v notify-send >/dev/null 2>&1; then
     notify-send "${DEPLOY_NOTIFY_TITLE}: ${subtitle}" "${body}" >/dev/null 2>&1 || true
   fi
+}
+
+notify_serverchan() {
+  local subtitle="$1"
+  local body="$2"
+
+  if [[ "${DEPLOY_SERVERCHAN_ENABLED}" != "1" || -z "${DEPLOY_SERVERCHAN_SENDKEY}" ]]; then
+    return 0
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    return 0
+  fi
+
+  curl -fsS --retry 1 --max-time 10 -X POST \
+    "${DEPLOY_SERVERCHAN_API_BASE%/}/${DEPLOY_SERVERCHAN_SENDKEY}.send" \
+    --data-urlencode "title=${DEPLOY_SERVERCHAN_TITLE} ${subtitle}" \
+    --data-urlencode "desp=${body}" >/dev/null 2>&1 || true
+}
+
+build_serverchan_body() {
+  local status="$1"
+  local message="$2"
+  cat <<BODY
+### 部署${status}
+- 服务：renfu
+- 服务器：${SERVER_USER}@${SERVER_HOST}:${SERVER_APP_DIR}
+- 提交：${DEPLOY_COMMIT_SHA:-unknown}
+- 结果：${message}
+- 时间：$(date '+%F %T')
+BODY
 }
 
 write_status() {
@@ -177,9 +221,13 @@ case "${DEPLOY_OUTCOME}" in
     if [[ "${DEPLOY_NOTIFY_SUCCESS}" == "1" ]]; then
       notify_local "Success" "${DEPLOY_OUTCOME_MESSAGE}"
     fi
+    if [[ "${DEPLOY_SERVERCHAN_SUCCESS}" == "1" ]]; then
+      notify_serverchan "Success" "$(build_serverchan_body '成功' "${DEPLOY_OUTCOME_MESSAGE}")"
+    fi
     ;;
   failed)
     notify_local "Failed" "${DEPLOY_OUTCOME_MESSAGE}; log: /tmp/renfu-pre-push.log"
+    notify_serverchan "Failed" "$(build_serverchan_body '失败' "${DEPLOY_OUTCOME_MESSAGE}; log: /tmp/renfu-pre-push.log")"
     ;;
   skipped)
     ;;

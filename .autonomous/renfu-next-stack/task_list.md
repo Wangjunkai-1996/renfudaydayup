@@ -1,0 +1,12 @@
+- [x] Create backend FastAPI scaffold
+- [x] Create frontend Vue scaffold
+- [x] Add auth and user isolation foundations
+- [x] Add modular API routes and WebSocket stream
+- [x] Add Alembic, worker stubs, and legacy import script
+- [x] Save execution plan and handoff docs into the repo
+- [x] Bridge legacy reports and diagnostics into new APIs for `legacy_admin`
+- [x] Add frontend realtime store and route-level code splitting
+- [ ] Replace worker stubs with migrated real-time market and strategy engines
+- [ ] Migrate legacy tuning/report generation to user-isolated domain services
+- [ ] Complete production deployment wiring for API, worker, frontend, PostgreSQL, and Redis
+- [ ] Expand automated coverage for reports, diagnostics, watchlist, and websocket flows

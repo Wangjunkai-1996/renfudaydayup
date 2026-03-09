@@ -18,3 +18,8 @@ data/server.pid
 # Local virtual env
 .venv/
 venv/
+backend/.env
+backend/.venv/
+frontend/node_modules/
+frontend/dist/
+.autonomous/

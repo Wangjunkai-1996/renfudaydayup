@@ -51,6 +51,9 @@ from renfu.watchlist_store import (
 )
 
 app = Flask(__name__)
+app.config['JSON_SORT_KEYS'] = False
+if hasattr(app, 'json') and hasattr(app.json, 'sort_keys'):
+    app.json.sort_keys = False
 sock = Sock(app) if Sock is not None else None
 notification_hub = NotificationHub.from_env()
 
@@ -1845,6 +1848,127 @@ def get_latest_paper_orders_for_signal_ids(signal_ids):
             'order': order
         }
     return mapping
+
+
+def summarize_signal_records(records, paper_map=None, executed_only=False):
+    normalized = []
+    for row in records or []:
+        record = dict(row)
+        sig_id = str(record.get('id') or '').strip()
+        if sig_id and 'paper' not in record and isinstance(paper_map, dict) and sig_id in paper_map:
+            record['paper'] = copy.deepcopy(paper_map[sig_id])
+        if executed_only and not bool((record.get('paper') or {}).get('executed')):
+            continue
+        normalized.append(record)
+
+    total = len(normalized)
+    success = sum(1 for r in normalized if r.get('status') == 'success')
+    fail = sum(1 for r in normalized if r.get('status') == 'fail')
+    pending = sum(1 for r in normalized if r.get('status') == 'pending')
+    flat = sum(1 for r in normalized if r.get('status') == 'flat')
+    completed = success + fail
+    win_rate = round(success * 100.0 / completed, 2) if completed > 0 else 0.0
+
+    by_type = {}
+    for sig_type in ('BUY', 'SELL'):
+        subset = [r for r in normalized if r.get('type') == sig_type]
+        s = sum(1 for r in subset if r.get('status') == 'success')
+        f = sum(1 for r in subset if r.get('status') == 'fail')
+        c = s + f
+        avg_profit = round(sum((r.get('profit_pct') or 0.0) for r in subset if r.get('status') in ('success', 'fail')) / c, 4) if c else 0.0
+        by_type[sig_type] = {
+            'total': len(subset),
+            'success': s,
+            'fail': f,
+            'pending': sum(1 for r in subset if r.get('status') == 'pending'),
+            'flat': sum(1 for r in subset if r.get('status') == 'flat'),
+            'completed': c,
+            'win_rate': round(s * 100.0 / c, 2) if c else 0.0,
+            'avg_profit_pct': avg_profit
+        }
+
+    by_code_stats = collections.defaultdict(lambda: {'name': '', 'total': 0, 'success': 0, 'fail': 0, 'pending': 0, 'flat': 0, 'profit_sum': 0.0, 'profit_n': 0})
+    for r in normalized:
+        code = r.get('code', '')
+        stat = by_code_stats[code]
+        stat['name'] = r.get('name', stat['name'])
+        stat['total'] += 1
+        if r.get('status') == 'success':
+            stat['success'] += 1
+            stat['profit_sum'] += (r.get('profit_pct') or 0.0)
+            stat['profit_n'] += 1
+        elif r.get('status') == 'fail':
+            stat['fail'] += 1
+            stat['profit_sum'] += (r.get('profit_pct') or 0.0)
+            stat['profit_n'] += 1
+        elif r.get('status') == 'flat':
+            stat['flat'] += 1
+        else:
+            stat['pending'] += 1
+
+    by_code = []
+    for code, stat in by_code_stats.items():
+        comp = stat['success'] + stat['fail']
+        by_code.append({
+            'code': code,
+            'name': stat['name'],
+            'total': stat['total'],
+            'success': stat['success'],
+            'fail': stat['fail'],
+            'pending': stat['pending'],
+            'flat': stat['flat'],
+            'completed': comp,
+            'win_rate': round(stat['success'] * 100.0 / comp, 2) if comp else 0.0,
+            'avg_profit_pct': round(stat['profit_sum'] / stat['profit_n'], 4) if stat['profit_n'] else 0.0
+        })
+    by_code.sort(key=lambda x: (-x['total'], str(x['code'])))
+
+    return {
+        'totals': {
+            'total': total,
+            'success': success,
+            'fail': fail,
+            'pending': pending,
+            'flat': flat,
+            'completed': completed,
+            'win_rate': win_rate
+        },
+        'by_type': by_type,
+        'by_code': by_code
+    }
+
+
+def build_signal_execution_summary(records, paper_map=None):
+    normalized = []
+    order_status_counts = collections.Counter()
+    signals_with_paper = 0
+    signals_executed = 0
+
+    for row in records or []:
+        record = dict(row)
+        sig_id = str(record.get('id') or '').strip()
+        paper = record.get('paper')
+        if sig_id and paper is None and isinstance(paper_map, dict):
+            paper = paper_map.get(sig_id)
+        if paper:
+            record['paper'] = copy.deepcopy(paper)
+            signals_with_paper += 1
+            order_status_counts[str((paper or {}).get('status') or 'unknown')] += 1
+            if bool((paper or {}).get('executed')):
+                signals_executed += 1
+        normalized.append(record)
+
+    executed_summary = summarize_signal_records(normalized, executed_only=True)
+    return {
+        'signals_with_paper': signals_with_paper,
+        'signals_executed': signals_executed,
+        'signals_not_executed': max(0, signals_with_paper - signals_executed),
+        'signals_without_paper': max(0, len(normalized) - signals_with_paper),
+        'order_status_counts': dict(order_status_counts),
+        'totals': executed_summary['totals'],
+        'by_type': executed_summary['by_type'],
+        'by_code': executed_summary['by_code']
+    }
 
 def get_paper_snapshot(current_state=None, recent_limit=30):
     current_state = current_state or {}
@@ -3660,9 +3784,16 @@ def apply_remove_stock(code, persist=True):
 
     removed_name = None
     purged_runtime = 0
+    force_closed_pending = 0
+    db_updates = []
+    debug_events = []
     with state_lock:
         if c in active_stocks:
             removed_name = active_stocks.get(c, '')
+            latest_price = 0.0
+            data_list = market_data.get(c) or []
+            if data_list:
+                latest_price = float(data_list[-1].get('price') or 0.0)
             del active_stocks[c]
             market_data.pop(c, None)
             analyzers.pop(c, None)
@@ -3672,10 +3803,42 @@ def apply_remove_stock(code, persist=True):
             buy_outcomes.pop(c, None)
             risk_state.get('stock_consecutive_fail', {}).pop(c, None)
 
-            before_count = len(signals_history)
-            signals_history[:] = [s for s in signals_history if str(s.get('code', '')).lower() != c]
+            for sig in signals_history:
+                if str(sig.get('code', '')).lower() != c:
+                    continue
+                if str(sig.get('status') or '') != 'pending':
+                    continue
+                cp = latest_price or float(sig.get('price') or 0.0)
+                gross_return, net_return, final = classify_trade_result(sig.get('type'), sig.get('price', 0.0), cp, code=c)
+                sig['status'] = final
+                sig['resolved_price'] = cp
+                sig['gross_profit_pct'] = gross_return * 100
+                sig['profit_pct'] = net_return * 100
+                sig['resolve_msg'] = f"🧹 移除自选时平仓 (净{sig['profit_pct']:+.2f}% / 毛{sig['gross_profit_pct']:+.2f}%)"
+                if sig['type'] == 'BUY':
+                    record_buy_outcome(c, final == 'success')
+                update_risk_state_on_resolution(sig, final)
+                db_updates.append((sig['id'], final, cp, sig['gross_profit_pct'], sig['profit_pct'], sig['resolve_msg'], sig.get('date')))
+                debug_events.append({
+                    'event': 'signal_force_closed',
+                    'date': sig.get('date'),
+                    'phase': 'stock_removed',
+                    'time': sig.get('time', ''),
+                    'signal_id': sig.get('id', ''),
+                    'code': c,
+                    'name': sig.get('name', ''),
+                    'signal_type': sig.get('type', ''),
+                    'status': final,
+                    'entry_price': sig.get('price', 0.0),
+                    'resolved_price': cp,
+                    'gross_profit_pct': sig.get('gross_profit_pct', 0.0),
+                    'profit_pct': sig.get('profit_pct', 0.0),
+                    'resolve_msg': sig.get('resolve_msg', ''),
+                    'strategy': get_strategy_snapshot()
+                })
+                force_closed_pending += 1
+
             pending_signals[:] = [s for s in pending_signals if str(s.get('code', '')).lower() != c]
-            purged_runtime = max(0, before_count - len(signals_history))
 
             today = datetime.datetime.now().strftime('%Y-%m-%d')
             day_rows = [s for s in signals_history if str(s.get('date') or today) == today]
@@ -3701,14 +3864,21 @@ def apply_remove_stock(code, persist=True):
 
     if persist:
         remove_watchlist_entry(c)
-    purged_db = db_delete_signals_by_code(c)
+
+    for sig_id, final_status, resolved_price, gross_profit_pct, profit_pct, resolve_msg, sig_date in db_updates:
+        db_resolve_signal(sig_id, final_status, resolved_price, gross_profit_pct, profit_pct, resolve_msg, signal_date=sig_date)
+    for event in debug_events:
+        log_debug_event(event.pop('event'), event, target_date=event.get('date'))
+
+    purged_db = 0
     log_debug_event(
         'stock_removed',
         {
             'code': c,
             'name': removed_name,
             'purged_runtime_signals': purged_runtime,
-            'purged_db_signals': purged_db
+            'purged_db_signals': purged_db,
+            'force_closed_pending': force_closed_pending
         }
     )
     return True, removed_name
@@ -3784,6 +3954,9 @@ def fetch_worker():
                 health_state['quote_provider'] = quote_provider.snapshot()
                 health_state['quote_provider']['active_provider'] = provider_name
                 health_state['last_fetch_ok_ts'] = time.time()
+                health_state['request_errors'] = 0
+                health_state['worker_errors'] = 0
+                health_state['last_error'] = ''
                 provider_switched = bool(provider_name and provider_name != prev_provider)
             if provider_switched:
                 log_debug_event(
@@ -4149,6 +4322,7 @@ def fetch_worker():
                 health_state['request_errors'] = int(health_state.get('request_errors', 0)) + 1
                 health_state['last_error'] = str(e)
                 health_state['quote_provider'] = quote_provider.snapshot()
+            update_health_alerts()
             log_debug_event('worker_error', {'error': str(e)})
             
         time.sleep(3)
@@ -4236,6 +4410,7 @@ def build_data_payload(since_ts=None, force_full=False):
                 continue
             if sig_id in paper_map:
                 s['paper'] = paper_map[sig_id]
+    stats_snapshot['execution'] = build_signal_execution_summary(signals_snapshot, paper_map=paper_map)
 
     market_payload = {}
     if mode == 'full':
@@ -5569,7 +5744,7 @@ def generate_daily_report(target_date, trigger='manual'):
     conn = get_db()
     rows = conn.execute(
         '''
-        SELECT date, time, seq_no, code, name, type, price, status, resolved_price, gross_profit_pct, profit_pct, desc, resolve_msg, created_at, resolved_at
+        SELECT id, date, time, seq_no, code, name, type, price, status, resolved_price, gross_profit_pct, profit_pct, desc, resolve_msg, created_at, resolved_at
         FROM signals
         WHERE date=?
         ORDER BY time ASC, created_at ASC
@@ -5579,60 +5754,18 @@ def generate_daily_report(target_date, trigger='manual'):
     conn.close()
 
     records = [dict(r) for r in rows]
-    total = len(records)
-    success = sum(1 for r in records if r['status'] == 'success')
-    fail = sum(1 for r in records if r['status'] == 'fail')
-    pending = sum(1 for r in records if r['status'] == 'pending')
-    completed = success + fail
-    win_rate = round(success * 100.0 / completed, 2) if completed > 0 else 0.0
-
-    by_type = {}
-    for sig_type in ('BUY', 'SELL'):
-        subset = [r for r in records if r.get('type') == sig_type]
-        s = sum(1 for r in subset if r['status'] == 'success')
-        f = sum(1 for r in subset if r['status'] == 'fail')
-        c = s + f
-        avg_profit = round(sum((r.get('profit_pct') or 0.0) for r in subset if r['status'] in ('success', 'fail')) / c, 4) if c else 0.0
-        by_type[sig_type] = {
-            'total': len(subset),
-            'success': s,
-            'fail': f,
-            'pending': sum(1 for r in subset if r['status'] == 'pending'),
-            'win_rate': round(s * 100.0 / c, 2) if c else 0.0,
-            'avg_profit_pct': avg_profit
-        }
-
-    by_code_stats = collections.defaultdict(lambda: {'name': '', 'total': 0, 'success': 0, 'fail': 0, 'pending': 0, 'profit_sum': 0.0, 'profit_n': 0})
-    for r in records:
-        c = r.get('code', '')
-        st = by_code_stats[c]
-        st['name'] = r.get('name', st['name'])
-        st['total'] += 1
-        if r['status'] == 'success':
-            st['success'] += 1
-            st['profit_sum'] += (r.get('profit_pct') or 0.0)
-            st['profit_n'] += 1
-        elif r['status'] == 'fail':
-            st['fail'] += 1
-            st['profit_sum'] += (r.get('profit_pct') or 0.0)
-            st['profit_n'] += 1
-        else:
-            st['pending'] += 1
-
-    by_code = []
-    for code, st in by_code_stats.items():
-        comp = st['success'] + st['fail']
-        by_code.append({
-            'code': code,
-            'name': st['name'],
-            'total': st['total'],
-            'success': st['success'],
-            'fail': st['fail'],
-            'pending': st['pending'],
-            'win_rate': round(st['success'] * 100.0 / comp, 2) if comp else 0.0,
-            'avg_profit_pct': round(st['profit_sum'] / st['profit_n'], 4) if st['profit_n'] else 0.0
-        })
-    by_code.sort(key=lambda x: x['total'], reverse=True)
+    signal_summary = summarize_signal_records(records)
+    totals = signal_summary['totals']
+    by_type = signal_summary['by_type']
+    by_code = signal_summary['by_code']
+    total = int(totals.get('total', 0) or 0)
+    success = int(totals.get('success', 0) or 0)
+    fail = int(totals.get('fail', 0) or 0)
+    pending = int(totals.get('pending', 0) or 0)
+    completed = int(totals.get('completed', 0) or 0)
+    win_rate = float(totals.get('win_rate', 0.0) or 0.0)
+    paper_map = get_latest_paper_orders_for_signal_ids([r.get('id') for r in records])
+    execution_summary = build_signal_execution_summary(records, paper_map=paper_map)
 
     debug_entries = read_debug_log_entries(target_date, limit=50000)
     debug_summary = summarize_debug_entries(debug_entries)
@@ -5653,6 +5786,7 @@ def generate_daily_report(target_date, trigger='manual'):
         },
         'by_type': by_type,
         'by_code': by_code,
+        'execution': execution_summary,
         'debug_summary': debug_summary,
         'periodic': periodic
     }
@@ -5673,6 +5807,12 @@ def generate_daily_report(target_date, trigger='manual'):
         f"- 已完成: {completed} (成功 {success} / 失败 {fail})",
         f"- 挂单: {pending}",
         f"- 胜率: {win_rate:.2f}%",
+        "",
+        "## 已成交口径",
+        f"- 有纸面订单信号: {execution_summary['signals_with_paper']}",
+        f"- 已成交信号: {execution_summary['signals_executed']}",
+        f"- 未成交信号: {execution_summary['signals_not_executed']}",
+        f"- 已成交胜率: {float(execution_summary['totals'].get('win_rate', 0.0) or 0.0):.2f}%",
         "",
         "## 分方向",
     ]
@@ -6074,6 +6214,8 @@ register_management_routes(
     save_param_version=save_param_version,
     get_param_version=get_param_version,
     apply_remove_stock=apply_remove_stock,
+    get_latest_paper_orders_for_signal_ids=get_latest_paper_orders_for_signal_ids,
+    build_signal_execution_summary=build_signal_execution_summary,
     get_db=get_db,
     send_test_notification=send_test_notification
 )

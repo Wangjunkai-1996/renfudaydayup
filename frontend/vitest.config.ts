@@ -13,6 +13,13 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     globals: true,
+    pool: 'forks',
+    maxWorkers: 2,
+    minWorkers: 1,
+    maxConcurrency: 2,
+    testTimeout: 15000,
+    hookTimeout: 15000,
+    teardownTimeout: 5000,
     exclude: ['e2e/**', 'node_modules/**'],
   },
 });

@@ -37,6 +37,7 @@ class WatchlistItemOut(BaseModel):
     symbol: str
     display_name: str
     notes: str
+    sort_order: int
     created_at: datetime
 
 
@@ -67,7 +68,7 @@ class SignalOut(BaseModel):
     description: str
     occurred_at: datetime
     resolved_at: Optional[datetime] = None
-    meta_json: dict[str, Any]
+    meta_json: dict[str, Any] = Field(default_factory=dict)
 
 
 class SignalExplanationOut(BaseModel):
@@ -150,6 +151,7 @@ class DashboardSummary(BaseModel):
     signal_counts: dict[str, int]
     paper_summary: dict[str, Any]
     alerts: list[dict[str, Any]] = Field(default_factory=list)
+    workbench: Optional[dict[str, Any]] = None
 
 
 class DiagnosticsOverview(BaseModel):
@@ -157,6 +159,10 @@ class DiagnosticsOverview(BaseModel):
     focus_guard: dict[str, Any]
     rejection_monitor: dict[str, Any]
     focus_review: dict[str, Any]
+
+
+class NotificationSettingsOut(BaseModel):
+    settings_json: dict[str, Any] = Field(default_factory=dict)
 
 
 class AdminUserCreate(BaseModel):

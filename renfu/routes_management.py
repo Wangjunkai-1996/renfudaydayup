@@ -28,6 +28,8 @@ def register_management_routes(
     save_param_version,
     get_param_version,
     apply_remove_stock,
+    get_latest_paper_orders_for_signal_ids,
+    build_signal_execution_summary,
     get_db,
     send_test_notification
 ):
@@ -238,6 +240,14 @@ def register_management_routes(
                 status_q=status_q,
                 limit_q=limit_q
             )
+            signal_ids = [item.get('id') for item in (payload.get('signals') or [])]
+            paper_map = get_latest_paper_orders_for_signal_ids(signal_ids)
+            if paper_map:
+                for item in payload.get('signals') or []:
+                    sig_id = str(item.get('id') or '').strip()
+                    if sig_id and sig_id in paper_map:
+                        item['paper'] = paper_map[sig_id]
+            payload['execution'] = build_signal_execution_summary(payload.get('signals') or [], paper_map=paper_map)
             return jsonify(payload)
         except Exception as e:
             return jsonify({'success': False, 'msg': str(e)}), 500

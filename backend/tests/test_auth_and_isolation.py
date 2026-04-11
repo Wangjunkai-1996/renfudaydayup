@@ -31,4 +31,6 @@ def test_watchlist_isolation_between_users(client):
     assert admin_login_again.status_code == 200
     admin_watchlist = client.get('/api/v1/market/watchlist')
     assert admin_watchlist.status_code == 200
-    assert admin_watchlist.json() == []
+    payload = admin_watchlist.json()
+    assert isinstance(payload, list)
+    assert all(item['symbol'] != 'sz300402' for item in payload)

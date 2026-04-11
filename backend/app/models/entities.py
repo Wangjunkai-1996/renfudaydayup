@@ -41,6 +41,7 @@ class WatchlistItem(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     display_name: Mapped[str] = mapped_column(String(128), default='', nullable=False)
     notes: Mapped[str] = mapped_column(Text, default='', nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
 
 class StrategyConfig(UUIDPrimaryKeyMixin, TimestampMixin, Base):

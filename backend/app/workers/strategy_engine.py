@@ -25,8 +25,12 @@ def generate_user_signals() -> None:
                     .where(Signal.user_id == user.id, Signal.symbol == item.symbol)
                     .order_by(Signal.occurred_at.desc())
                 )
-                if existing is not None and (now - existing.occurred_at).total_seconds() < 1800:
-                    continue
+                if existing is not None:
+                    existing_occurred_at = existing.occurred_at
+                    if existing_occurred_at.tzinfo is None:
+                        existing_occurred_at = existing_occurred_at.replace(tzinfo=timezone.utc)
+                    if (now - existing_occurred_at).total_seconds() < 1800:
+                        continue
                 db.add(
                     Signal(
                         user_id=user.id,

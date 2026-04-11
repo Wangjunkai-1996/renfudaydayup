@@ -683,8 +683,163 @@ def test_remove_focus_stock_is_blocked(load_app):
     assert '固定首票' in (payload.get('msg') or '')
 
 
+def test_remove_stock_keeps_history_and_force_closes_pending(load_app):
+    app_module = load_app()
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+
+    with app_module.state_lock:
+        app_module.active_stocks.clear()
+        app_module.active_stocks[app_module.FOCUS_STOCK_CODE] = app_module.FOCUS_STOCK_NAME
+        app_module.active_stocks['sh600079'] = '测试股票'
+        app_module.market_data.clear()
+        app_module.market_data['sh600079'] = [
+            {'time': '10:30:00', 'price': 10.30, 'vwap': 10.20, 'ts': 1.0}
+        ]
+        app_module.signals_history.clear()
+        app_module.pending_signals.clear()
+        app_module.success_rates['trade_cost_buffer'] = 0.0
+        app_module.success_rates['stocks'] = {}
+
+    pending_sig = {
+        'id': 'rm_pending_1', 'date': today, 'time': '10:05:00', 'seq_no': 2,
+        'code': 'sh600079', 'name': '测试股票', 'type': 'BUY', 'level': 1,
+        'price': 10.0, 'desc': 'pending-remove', 'status': 'pending'
+    }
+    resolved_sig = {
+        'id': 'rm_done_1', 'date': today, 'time': '09:55:00', 'seq_no': 1,
+        'code': 'sh600079', 'name': '测试股票', 'type': 'BUY', 'level': 1,
+        'price': 10.0, 'desc': 'done-keep', 'status': 'success',
+        'profit_pct': 1.0, 'gross_profit_pct': 1.1, 'resolved_price': 10.1
+    }
+
+    app_module.db_save_signal(pending_sig)
+    conn = app_module.get_db()
+    conn.execute(
+        '''
+        INSERT INTO signals (id, date, time, seq_no, code, name, type, level, price, desc, status, resolved_price, gross_profit_pct, profit_pct, resolve_msg)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+        (
+            resolved_sig['id'], resolved_sig['date'], resolved_sig['time'], resolved_sig['seq_no'],
+            resolved_sig['code'], resolved_sig['name'], resolved_sig['type'], resolved_sig['level'],
+            resolved_sig['price'], resolved_sig['desc'], resolved_sig['status'], resolved_sig['resolved_price'],
+            resolved_sig['gross_profit_pct'], resolved_sig['profit_pct'], 'manual-success'
+        )
+    )
+    conn.commit()
+    conn.close()
+
+    with app_module.state_lock:
+        app_module.signals_history[:] = [dict(pending_sig), dict(resolved_sig)]
+        app_module.pending_signals[:] = [app_module.signals_history[0]]
+
+    ok, msg = app_module.apply_remove_stock('sh600079', persist=False)
+
+    assert ok is True
+    assert msg == '测试股票'
+    with app_module.state_lock:
+        assert 'sh600079' not in app_module.active_stocks
+        assert not app_module.pending_signals
+        assert {item['id'] for item in app_module.signals_history} == {'rm_pending_1', 'rm_done_1'}
+        resolved_pending = next(item for item in app_module.signals_history if item['id'] == 'rm_pending_1')
+        assert resolved_pending['status'] == 'success'
+        assert '移除自选时平仓' in (resolved_pending.get('resolve_msg') or '')
+
+    conn = app_module.get_db()
+    rows = conn.execute(
+        "SELECT id, status, resolve_msg FROM signals WHERE code='sh600079' ORDER BY seq_no"
+    ).fetchall()
+    conn.close()
+    assert len(rows) == 2
+    assert {row['id'] for row in rows} == {'rm_pending_1', 'rm_done_1'}
+    pending_row = next(row for row in rows if row['id'] == 'rm_pending_1')
+    assert pending_row['status'] == 'success'
+    assert '移除自选时平仓' in (pending_row['resolve_msg'] or '')
+
+
+def test_history_endpoint_includes_execution_summary_and_paper_state(load_app):
+    app_module = load_app()
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    conn = app_module.get_db()
+    conn.execute(
+        '''
+        INSERT INTO signals (id, date, time, seq_no, code, name, type, level, price, desc, status, profit_pct, gross_profit_pct)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+        ('hist_exec_1', today, '10:00:00', 1, 'sh600079', '测试股票', 'BUY', 1, 10.0, 'exec-win', 'success', 0.8, 0.9)
+    )
+    conn.execute(
+        '''
+        INSERT INTO signals (id, date, time, seq_no, code, name, type, level, price, desc, status, profit_pct, gross_profit_pct)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+        ('hist_exec_2', today, '10:15:00', 2, 'sh600079', '测试股票', 'SELL', 1, 10.0, 'exec-lose', 'fail', -0.4, -0.3)
+    )
+    conn.execute(
+        '''
+        INSERT INTO paper_orders (order_id, signal_id, date, time, code, name, side, qty, price, amount, fee, status, reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+        ('po_hist_1', 'hist_exec_1', today, '10:00:01', 'sh600079', '测试股票', 'BUY', 100, 10.0, 1000.0, 1.0, 'filled', 't_buy')
+    )
+    conn.execute(
+        '''
+        INSERT INTO paper_orders (order_id, signal_id, date, time, code, name, side, qty, price, amount, fee, status, reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+        ('po_hist_2', 'hist_exec_2', today, '10:15:01', 'sh600079', '测试股票', 'SELL', 0, 10.0, 0.0, 0.0, 'rejected', 'no_available_qty')
+    )
+    conn.commit()
+    conn.close()
+
+    client = app_module.app.test_client()
+    resp = client.get('/api/history?days=7&code=sh600079')
+    payload = resp.get_json()
+
+    assert resp.status_code == 200
+    assert payload.get('success') is True
+    assert payload.get('execution', {}).get('signals_with_paper') == 2
+    assert payload.get('execution', {}).get('signals_executed') == 1
+    assert payload.get('execution', {}).get('signals_not_executed') == 1
+    assert payload.get('execution', {}).get('totals', {}).get('total') == 1
+    assert payload.get('execution', {}).get('totals', {}).get('success') == 1
+    paper_statuses = {item['id']: ((item.get('paper') or {}).get('status')) for item in payload.get('signals') or []}
+    assert paper_statuses['hist_exec_1'] == 'filled'
+    assert paper_statuses['hist_exec_2'] == 'rejected'
+
+
+def test_generate_daily_report_includes_execution_summary(load_app):
+    app_module = load_app()
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    conn = app_module.get_db()
+    conn.execute(
+        '''
+        INSERT INTO signals (id, date, time, seq_no, code, name, type, level, price, desc, status, profit_pct, gross_profit_pct)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+        ('report_exec_1', today, '10:20:00', 1, 'sh600079', '测试股票', 'BUY', 1, 10.0, 'report-exec', 'success', 1.2, 1.3)
+    )
+    conn.execute(
+        '''
+        INSERT INTO paper_orders (order_id, signal_id, date, time, code, name, side, qty, price, amount, fee, status, reason)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''',
+        ('po_report_1', 'report_exec_1', today, '10:20:01', 'sh600079', '测试股票', 'BUY', 100, 10.0, 1000.0, 1.0, 'filled', 't_buy')
+    )
+    conn.commit()
+    conn.close()
+
+    report, _ = app_module.generate_daily_report(today, trigger='manual_test')
+
+    assert report['execution']['signals_with_paper'] == 1
+    assert report['execution']['signals_executed'] == 1
+    assert report['execution']['totals']['total'] == 1
+    assert report['execution']['totals']['success'] == 1
+
+
 def test_history_endpoint_supports_code_and_status_filters(load_app):
     app_module = load_app()
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
     conn = app_module.get_db()
     conn.execute(
         '''
@@ -692,7 +847,7 @@ def test_history_endpoint_supports_code_and_status_filters(load_app):
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''',
         (
-            'sig_filter_demo', '2026-03-03', '10:05:00', 1, 'sh600079', '测试股票',
+            'sig_filter_demo', today, '10:05:00', 1, 'sh600079', '测试股票',
             'BUY', 1, 10.0, 'filter-demo', 'success', 0.8, 0.9
         )
     )

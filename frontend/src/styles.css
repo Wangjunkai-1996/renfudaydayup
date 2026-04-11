@@ -12,6 +12,7 @@ body {
     radial-gradient(circle at top, rgba(79, 70, 229, 0.18), transparent 28%),
     radial-gradient(circle at right top, rgba(56, 189, 248, 0.16), transparent 24%),
     linear-gradient(180deg, #020617 0%, #08111f 42%, #020617 100%);
+  color: #e2e8f0;
 }
 
 #app {
@@ -19,5 +20,38 @@ body {
 }
 
 .glass-card {
-  @apply rounded-3xl border border-slate-800/80 bg-slate-900/70 shadow-card backdrop-blur;
+  @apply rounded-3xl border border-slate-800/80 bg-slate-900/70 shadow-2xl backdrop-blur;
+}
+
+.panel-table {
+  @apply min-w-full divide-y divide-slate-800 text-sm;
+}
+
+.panel-table thead th {
+  @apply px-4 py-3 text-left text-xs font-medium uppercase tracking-[0.24em] text-slate-500;
+}
+
+.panel-table tbody td {
+  @apply px-4 py-3 align-top text-slate-300;
+}
+
+.input-base {
+  @apply w-full rounded-2xl border border-slate-700 bg-slate-950/70 px-4 py-2.5 text-sm text-white outline-none transition focus:border-indigo-400;
+}
+
+.btn-primary {
+  @apply rounded-2xl bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white transition hover:bg-indigo-500;
+}
+
+.btn-secondary {
+  @apply rounded-2xl border border-slate-700 bg-slate-900/70 px-4 py-2.5 text-sm text-slate-200 transition hover:bg-slate-800;
+}
+
+.btn-danger {
+  @apply rounded-2xl bg-rose-500/10 px-4 py-2.5 text-sm text-rose-200 transition hover:bg-rose-500/20;
+}
+
+.scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(100, 116, 139, 0.7) rgba(15, 23, 42, 0.2);
 }

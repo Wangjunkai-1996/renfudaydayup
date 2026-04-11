@@ -8,5 +8,7 @@ if [[ ! -x .venv/bin/python ]]; then
   python3 -m venv .venv
 fi
 
+API_PORT="${RENFU_NEXT_API_PORT:-9000}"
+
 .venv/bin/pip install -r requirements.txt
-exec .venv/bin/uvicorn app.main:app --reload --host 0.0.0.0 --port 9000
+exec .venv/bin/uvicorn app.main:app --reload --host 0.0.0.0 --port "${API_PORT}"

@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from app.api.v1 import admin, auth, dashboard, diagnostics, market, paper, reports, signals, strategy, system, tuning, users
+from app.api.v1 import admin, auth, dashboard, diagnostics, market, paper, reports, settings, signals, strategy, system, tuning, users
 
 
 router = APIRouter(prefix='/api/v1')
@@ -15,4 +15,5 @@ router.include_router(reports.router)
 router.include_router(diagnostics.router)
 router.include_router(tuning.router)
 router.include_router(admin.router)
+router.include_router(settings.router)
 router.include_router(system.router)

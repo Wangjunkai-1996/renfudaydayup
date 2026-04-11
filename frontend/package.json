@@ -7,8 +7,9 @@
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
-    "test": "vitest",
-    "test:run": "vitest run",
+    "test": "node scripts/run-vitest-safe.mjs",
+    "test:run": "node scripts/run-vitest-safe.mjs run",
+    "test:file": "node scripts/run-vitest-safe.mjs run",
     "e2e": "playwright test"
   },
   "dependencies": {

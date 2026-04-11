@@ -12,6 +12,10 @@ class WatchlistCreate(BaseModel):
     notes: str = ''
 
 
+class WatchlistReorderInput(BaseModel):
+    symbols: list[str] = Field(default_factory=list)
+
+
 class StrategyConfigUpdate(BaseModel):
     config_json: dict[str, Any] = Field(default_factory=dict)
 
@@ -58,3 +62,16 @@ class CompareRequest(BaseModel):
 class TuningApplyRequest(BaseModel):
     patch: dict[str, Any] = Field(default_factory=dict)
     note: str = ''
+
+
+class SettingsAccountUpdate(BaseModel):
+    username: str
+
+
+class SettingsPasswordUpdate(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class NotificationSettingsUpdate(BaseModel):
+    settings_json: dict[str, Any] = Field(default_factory=dict)
